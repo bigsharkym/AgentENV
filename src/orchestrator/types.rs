@@ -27,6 +27,8 @@ pub enum SandboxLaunchSource {
 #[derive(Clone)]
 pub struct CreateSandboxRequest {
     pub source: SandboxLaunchSource,
+    /// Launch-time drives that are not part of the source snapshot.
+    pub extra_drives: Vec<crate::sandbox::ExtraDrive>,
     pub timeout: Option<Duration>,
     pub timeout_action: super::SandboxTimeoutAction,
     pub auto_resume: bool,
@@ -46,6 +48,16 @@ pub struct CreateSandboxRequest {
     /// migrated from a paused source remains paused on the target node.
     /// Default is `false` (the legacy behavior: launch into Running).
     pub start_paused: bool,
+    /// Volume mounts requested for this sandbox, keyed by guest path.
+    pub volume_mounts: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SandboxForkChildSpec {
+    pub sandbox_id: SandboxId,
+    pub volume_mounts: HashMap<String, String>,
+    pub extra_drives: Vec<crate::sandbox::ExtraDrive>,
+    pub replace_drive_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
