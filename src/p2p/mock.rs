@@ -10,7 +10,8 @@ use std::time::Duration;
 use super::error::{Error, Result};
 use super::transport::{P2pByteStream, P2pTransport};
 use super::types::{
-    P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProviderHint, P2pPublishRequest,
+    P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProviderHint, P2pFetchOptions,
+    P2pPublishRequest,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -90,7 +91,12 @@ impl P2pTransport for MockTransport {
         }
     }
 
-    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64> {
+    async fn fetch_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        destination: &Path,
+        _options: P2pFetchOptions,
+    ) -> Result<u64> {
         self.fetch_count.fetch_add(1, Ordering::Relaxed);
         let blobs = self.blobs.read().await;
         let data = blobs
@@ -102,7 +108,11 @@ impl P2pTransport for MockTransport {
         Ok(data.len() as u64)
     }
 
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+    async fn fetch_bytes_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        _options: P2pFetchOptions,
+    ) -> Result<Bytes> {
         self.fetch_count.fetch_add(1, Ordering::Relaxed);
         let blobs = self.blobs.read().await;
         blobs
