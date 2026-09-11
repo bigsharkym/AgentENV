@@ -126,6 +126,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub node_identity: NodeIdentityConfig,
     #[config(nested)]
+    pub template_build: TemplateBuildConfig,
+    #[config(nested)]
     pub memory_snapshot: MemorySnapshotConfig,
     #[config(nested)]
     pub pool: PoolTomlConfig,
@@ -487,6 +489,23 @@ pub struct MemorySnapshotConfig {
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
 
+/// Resources for managed Dockerfile build workers.
+#[derive(Debug, Config, Clone)]
+pub struct TemplateBuildConfig {
+    /// Maximum managed builds admitted per node, including publication and cleanup.
+    #[config(default = 4usize)]
+    pub max_concurrent_builds: usize,
+    #[config(default = "docker.io/moby/buildkit:v0.33.0")]
+    pub builder_image: String,
+    #[config(default = 16u32)]
+    pub builder_cpu_count: u32,
+    #[config(default = 32768u32)]
+    pub builder_memory_mb: u32,
+    /// Capacity of each build's writable clone of the repository's shared cache seed.
+    #[config(default = 65536u64)]
+    pub cache_size_mb: u64,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct MemorySnapshotBackgroundDownloadConfig {
     #[config(default = true)]
@@ -694,6 +713,7 @@ impl_config_default!(
     UblkTomlConfig,
     UblkOverlaybdTomlConfig,
     MemorySnapshotConfig,
+    TemplateBuildConfig,
     MemorySnapshotBackgroundDownloadConfig,
     ObservabilityConfig,
     ObservabilitySchedulerReportConfig,
@@ -995,6 +1015,30 @@ impl AppConfig {
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
         self.validate_volume_limits()?;
+        self.validate_template_builder()?;
+        Ok(())
+    }
+
+    fn validate_template_builder(&self) -> Result<()> {
+        let builder = &self.template_build;
+        if builder.max_concurrent_builds == 0 {
+            bail!("template_build.max_concurrent_builds must be greater than 0");
+        }
+        if builder.builder_image.trim().is_empty() {
+            bail!("template_build.builder_image must not be empty");
+        }
+        if !(1..=255).contains(&builder.builder_cpu_count) {
+            bail!("template_build.builder_cpu_count must be between 1 and 255");
+        }
+        if !(256..=i32::MAX as u32).contains(&builder.builder_memory_mb) {
+            bail!(
+                "template_build.builder_memory_mb must be between 256 and {} MiB",
+                i32::MAX
+            );
+        }
+        if builder.cache_size_mb < 1024 {
+            bail!("template_build.cache_size_mb must be at least 1024 MiB");
+        }
         Ok(())
     }
 
@@ -1447,6 +1491,44 @@ mod tests {
             access_token_hash_seed: Some("cluster-secret".to_string()),
         };
         assert!(!format!("{config:?}").contains("cluster-secret"));
+    }
+
+    #[test]
+    fn template_builder_defaults_and_validation() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.template_build.builder_cpu_count, 16);
+        assert_eq!(config.template_build.builder_memory_mb, 32768);
+        assert_eq!(config.template_build.max_concurrent_builds, 4);
+        assert_eq!(config.template_build.cache_size_mb, 65536);
+        assert_eq!(
+            config.template_build.builder_image,
+            format!(
+                "docker.io/moby/buildkit:{}",
+                include_str!("../config/buildkit-version").trim()
+            )
+        );
+        config.validate_template_builder().unwrap();
+        config.template_build.max_concurrent_builds = 0;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.max_concurrent_builds = 1;
+        config.validate_template_builder().unwrap();
+        config.template_build.builder_cpu_count = 0;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_cpu_count = 16;
+        config.template_build.builder_memory_mb = 255;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_memory_mb = i32::MAX as u32;
+        config.validate_template_builder().unwrap();
+        config.template_build.builder_memory_mb += 1;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_memory_mb = 32768;
+        config.volume.max_size_mb = 8192;
+        config.validate().unwrap();
+        config.template_build.cache_size_mb = 1023;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.cache_size_mb = 65536;
+        config.template_build.builder_image = " ".into();
+        assert!(config.validate_template_builder().is_err());
     }
 
     #[test]

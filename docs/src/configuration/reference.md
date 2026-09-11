@@ -585,3 +585,20 @@ and are then re-fetched on demand.
 | `block_size` | integer | `16777216` | Background download chunk size in bytes (16 MiB): one source request fetches a chunk of this size, aligned down to whole cache blocks. The cache keeps its own smaller block size for foreground reads, so background downloads keep large-request throughput while foreground keeps fine-grained on-demand reads. Peak scratch per active layer download is `block_size × concurrency`. |
 | `concurrency` | integer | `4` | Maximum number of in-flight block remote reads within a single remote layer. `1` keeps the historical serial behavior. Must be greater than zero. |
 | `max_inflight_blocks` | integer | `16` | Cap on concurrently downloading chunks enforced by each file-cache backend's download scheduler, shared by every concurrent layer download on that backend; bounds total scratch memory to `max_inflight_blocks` × the download chunk size (`block_size`). The value is fixed when the backend is created from the global config; a per-image `download` override never resizes the scheduler-owned cap (the first mismatch per scheduler is logged as `max_inflight_blocks_override_ignored`). Must be greater than zero. |
+
+## `[template_build]`
+
+Managed Dockerfile builder resources. The first Dockerfile
+build on a node prepares a reusable internal builder template. Each build mounts
+a separate clone of the repository's shared cache seed; concurrent builds do not
+queue for cache ownership. The last successfully published cache becomes the next
+seed, with best-effort reuse of concurrent branches.
+Builder resources do not change the resulting template's CPU or memory.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_concurrent_builds` | integer | `4` | Per-node limit for managed builds, including preparation, publication, and cleanup. Must be greater than zero. Excess builder PUT requests return HTTP 429 and leave the build waiting for retry. |
+| `builder_image` | string | `"docker.io/moby/buildkit:v0.33.0"` | Image containing the managed BuildKit daemon, client, and OCI runtime. |
+| `builder_cpu_count` | integer | `16` | Builder vCPUs, from 1 to 255. |
+| `builder_memory_mb` | integer | `32768` | Builder memory in MiB, from 256 to 2147483647. |
+| `cache_size_mb` | integer | `65536` | Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most `volume.max_size_mb`; changing it does not resize existing caches. |

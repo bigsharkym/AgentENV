@@ -8,6 +8,26 @@
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 ```
 
+Each release publishes `aenv-<os>-<arch>.tar.gz` for Linux and macOS on x86_64
+and aarch64 (arm64). The archive contains:
+
+```text
+aenv
+aenv-buildctl
+manifest.json
+```
+
+The manifest records the AgentENV version, BuildKit version, and platform.
+`SHA256SUMS` accompanies the release archives. The release workflow verifies the
+pinned upstream BuildKit download before packaging its client with `aenv`.
+
+Both `install-cli.sh` and the full `install.sh` download this single CLI archive
+and verify its GitHub release asset checksum before installing both executables.
+Installation does not contact the upstream BuildKit release. The private
+`aenv-buildctl` lives beside `aenv`, preserving an existing system `buildctl`.
+Set `INSTALL_DIR` for a user-local CLI installation. For manual installation,
+extract the archive and keep both executables in the same directory.
+
 Or build from source (requires Rust):
 
 ```bash
@@ -54,13 +74,16 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 | `-d, --detach` | Submit the build and return immediately without waiting |
 | `--timeout <SECS>` | Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with `--detach`. |
 
-### `aenv build <dockerfile> --name <name>`
+### `aenv build <context> --name <name>`
 
-Create a template from a local Dockerfile.
+Create a template from a local Dockerfile using BuildKit in an isolated microVM.
+The installers include the required `buildctl` executable. For source builds,
+install BuildKit's `buildctl` v0.33.0 or select an existing executable with `--buildctl`.
 
 ```bash
-aenv build ./Dockerfile --name my-app
-aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
+aenv build . --name my-app
+aenv build . -f deploy/docker/Dockerfile.agentenv --name aenv
+aenv build ./my-app --name my-app-v2 --build-arg VERSION=2
 ```
 
 | Flag | Description |
@@ -68,10 +91,28 @@ aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 | `--name <name>` | Required template name |
 | `--cpu <count>` | CPU cores for the template. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
 | `--memory <MiB>` | Memory for the template. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
-| `--image <image>` | Override the rootfs base. Defaults to the first concrete `FROM` image, then the server's `[image.resolver].default_image` if none is usable. Alias: `--user-image`. |
+| `-f, --file <path>` | Dockerfile path relative to the current directory. Defaults to `<context>/Dockerfile`. |
+| `--build-arg KEY=VALUE` | Repeatable build arguments. |
+| `--secret <spec>` | Repeatable BuildKit secret mount. |
+| `--no-cache` | Disable instruction cache for this build. |
+| `--timeout <seconds>` | Dockerfile build deadline; defaults to 3600. The CLI allows 10 additional minutes for provisioning and publication. |
 
-`aenv build` submits the build and returns immediately. Use
-`aenv template watch <template>` to wait for completion.
+The command supports multi-stage builds, file updates, and `.dockerignore`, shows
+BuildKit progress, and waits until the template is ready. The server manages the
+internal worker and releases it afterward. The first Dockerfile build prepares a
+reusable builder template. Each build clones a shared cache seed, allowing
+concurrent builds and cache reuse across template names and nodes. Builder image and sizing
+are configured in `[template_build]` on the server, with defaults of 16 vCPUs,
+32 GiB memory, and 64 GiB cache disk. `FROM`, `ENTRYPOINT`, `CMD`, and
+`HEALTHCHECK` in the final image determine the template's image, startup, and
+readiness. The final Dockerfile stage is always published.
+See [templates](../concepts/templates.md#aenv-build) for the
+complete workflow, cache management, and startup behavior.
+
+Interactive builds show a three-stage bar for builder preparation, image build,
+and template publication, with elapsed time and Dockerfile logs above the bar.
+`--progress plain` keeps plain logs; `--progress tty` selects BuildKit's native
+terminal display. Redirected output has no progress-bar control sequences.
 
 ### `aenv template list`
 

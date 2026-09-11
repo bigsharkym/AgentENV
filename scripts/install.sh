@@ -3,6 +3,7 @@
 # The server is configured as a systemd service (or prints a manual start
 # command if systemd is unavailable).
 # Downloads: aenv (cli)   -> /usr/local/bin/aenv
+#            buildctl -> /usr/local/bin/aenv-buildctl
 #            server -> /usr/local/bin/server
 #            dependencies -> /var/lib/aenv/deps
 #            ublk daemon -> /var/lib/aenv/ublk/uvm-ublk-daemon
@@ -87,6 +88,8 @@ command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
 command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
 command -v sha256sum >/dev/null 2>&1 || missing_packages+=(coreutils)
 command -v realpath >/dev/null 2>&1 || missing_packages+=(coreutils)
+command -v tar >/dev/null 2>&1 || missing_packages+=(tar)
+command -v gzip >/dev/null 2>&1 || missing_packages+=(gzip)
 
 if ((${#missing_packages[@]} > 0)); then
     if command -v apt-get >/dev/null 2>&1; then
@@ -107,7 +110,7 @@ if ((${#missing_packages[@]} > 0)); then
     fi
 fi
 
-for command in curl jq sha256sum realpath; do
+for command in curl jq sha256sum realpath tar gzip; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "error: required command is still unavailable after installation: ${command}" >&2
         exit 1
@@ -143,7 +146,8 @@ tmp_tarball="$(mktemp)"
 tmp_dir="$(mktemp -d)"
 current_env=""
 tmp_env=""
-trap 'rm -f "$release_metadata" "$tmp_cli" "$tmp_tarball" "$current_env" "$tmp_env"; rm -rf "$tmp_dir"' EXIT
+stage_dir=""
+trap 'rm -f "$release_metadata" "$tmp_cli" "$tmp_tarball" "$current_env" "$tmp_env"; rm -rf "$tmp_dir"; if [[ -n "$stage_dir" ]]; then sudo rm -rf "$stage_dir"; fi' EXIT
 
 api_headers=(
     -H "Accept: application/vnd.github+json"
@@ -193,9 +197,17 @@ sudo mkdir -p "$INSTALL_DIR"
 # ---------------------------------------------------------------------------
 # 1. Install the aenv CLI
 # ---------------------------------------------------------------------------
-echo "Downloading aenv CLI ..."
-download_release_asset "aenv-linux-${ARCH_TAG}" "$tmp_cli"
-sudo install -m 0755 "$tmp_cli" "${INSTALL_DIR}/aenv"
+echo "Downloading aenv CLI and buildctl ..."
+download_release_asset "aenv-linux-${ARCH_TAG}.tar.gz" "$tmp_cli"
+mkdir -p "$tmp_dir/cli"
+tar -xzf "$tmp_cli" -C "$tmp_dir/cli" aenv aenv-buildctl manifest.json
+test -s "$tmp_dir/cli/aenv"
+test -s "$tmp_dir/cli/aenv-buildctl"
+stage_dir="$(sudo mktemp -d "${INSTALL_DIR}/.aenv-install.XXXXXX")"
+sudo install -m 0755 "$tmp_dir/cli/aenv-buildctl" "$stage_dir/buildctl"
+sudo install -m 0755 "$tmp_dir/cli/aenv" "$stage_dir/aenv"
+sudo mv "$stage_dir/buildctl" "${INSTALL_DIR}/aenv-buildctl"
+sudo mv "$stage_dir/aenv" "${INSTALL_DIR}/aenv"
 
 # ---------------------------------------------------------------------------
 # 2. Install the server

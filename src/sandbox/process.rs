@@ -209,6 +209,10 @@ pub struct Executor {
 }
 
 impl Executor {
+    pub(crate) fn for_endpoint(address: String, token: Option<super::EnvdAccessToken>) -> Self {
+        Self::new(EnvdInstance::new(address, token))
+    }
+
     pub(super) fn new(envd_instance: EnvdInstance) -> Self {
         Self {
             envd_instance,
