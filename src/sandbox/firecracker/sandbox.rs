@@ -16,7 +16,6 @@ use super::config::{
     FirecrackerRuntimePolicy, FirecrackerSandboxConfig, FirecrackerSnapshotConfig,
     PersistentSnapshotRootGuard, MAX_EXTRA_DRIVES,
 };
-use super::manifest::FirecrackerSnapshotManifest;
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
@@ -27,6 +26,7 @@ use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
+use crate::sandbox::manifest::SandboxSnapshotManifest;
 
 use crate::cfg::ConfigManager;
 use crate::sandbox::access::EnvdAccessToken;
@@ -212,7 +212,7 @@ pub struct FirecrackerSandbox {
 /// Firecracker-specific captured snapshot payload kept alive for publication.
 #[derive(Debug)]
 pub struct FirecrackerCapturedSnapshot {
-    manifest: FirecrackerSnapshotManifest,
+    manifest: SandboxSnapshotManifest,
     _snapshot_root: Arc<PersistentSnapshotRootGuard>,
 }
 
@@ -291,7 +291,7 @@ impl PausedSandboxState for FirecrackerPausedState {
 
 impl FirecrackerCapturedSnapshot {
     pub(crate) fn new(
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
         snapshot_root: Arc<PersistentSnapshotRootGuard>,
     ) -> Self {
         Self {
@@ -300,7 +300,7 @@ impl FirecrackerCapturedSnapshot {
         }
     }
 
-    pub fn manifest(&self) -> &FirecrackerSnapshotManifest {
+    pub fn manifest(&self) -> &SandboxSnapshotManifest {
         &self.manifest
     }
 }
@@ -1170,7 +1170,7 @@ impl FirecrackerSandbox {
     pub async fn pause_to_dir(
         &mut self,
         snapshot_dir: &Path,
-    ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
+    ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
         if self.has_writable_persistent_volumes() {
             let envd = self
@@ -1198,7 +1198,7 @@ impl FirecrackerSandbox {
     async fn snapshot_to_dir(
         &self,
         snapshot_dir: &Path,
-    ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
+    ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
         // Local layers are always captured raw; when enabled, compression
         // happens once at publish time under `[snapshot.publish_compression]`.
@@ -1314,7 +1314,8 @@ impl FirecrackerSandbox {
         });
         snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
 
-        let mut manifest = FirecrackerSnapshotManifest::new(
+        let mut manifest = SandboxSnapshotManifest::new(
+            crate::sandbox::FIRECRACKER_BACKEND,
             vm_state_path.clone(),
             mem_overlaybd_config.image_config_path.clone(),
             mem_virtual_size,
