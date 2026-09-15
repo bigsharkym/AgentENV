@@ -43,8 +43,8 @@ use crate::sandbox::extra_drive::{
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
-    OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedReadOnlyDevice,
-    UblkBackend, UblkCreateSpec, UblkDeviceManager,
+    OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow,
+    SharedReadOnlyDevice, UblkBackend, UblkCreateSpec, UblkDevice, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::RunnableSnapshot;
@@ -185,6 +185,10 @@ pub struct FirecrackerSandbox {
     rootfs_runtime: Option<OverlaybdRuntimeHandle>,
     mem_ublk_device: Option<SharedReadOnlyDevice>,
     tools_ublk_device: Option<SharedReadOnlyDevice>,
+    /// Dedicated, non-shared memory device used only by startup-pack
+    /// recording VMs (`pack_recording = true`). Released with
+    /// `UblkDeviceManager::delete_device`, never returned to the warm pool.
+    mem_dedicated_device: Option<UblkDevice>,
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
     mem_snapshot_image_config_path: Option<PathBuf>,
@@ -208,6 +212,17 @@ pub struct FirecrackerSandbox {
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
+
+/// Firecracker-specific capture payload carried as [`CapturedSandboxSnapshot`]
+/// artifacts: what startup-pack recording needs to re-boot from the capture
+/// while the layers are still node-local, plus the lease keeping the capture
+/// directory alive for the detached recording/upload continuation.
+#[derive(Debug)]
+pub struct FirecrackerCaptureArtifacts {
+    snapshot_config: FirecrackerSnapshotConfig,
+    snapshot_dir: PathBuf,
+    snapshot_root: Arc<PersistentSnapshotRootGuard>,
+}
 
 #[derive(Clone, Debug)]
 pub struct FirecrackerPausedState {
@@ -279,6 +294,39 @@ impl PausedSandboxState for FirecrackerPausedState {
         Ok(CapturedSandboxSnapshot::new(
             FirecrackerCapturedSnapshot::new(manifest, dummy_guard),
         ))
+    }
+}
+
+impl FirecrackerCaptureArtifacts {
+    pub(crate) fn new(
+        snapshot_config: FirecrackerSnapshotConfig,
+        snapshot_dir: PathBuf,
+        snapshot_root: Arc<PersistentSnapshotRootGuard>,
+    ) -> Self {
+        Self {
+            snapshot_config,
+            snapshot_dir,
+            snapshot_root,
+        }
+    }
+
+    /// The snapshot config produced at capture time (identical memory/rootfs
+    /// layout to what publish exports). Startup-pack recording re-boots from
+    /// it while the layers are still node-local.
+    pub fn snapshot_config(&self) -> &FirecrackerSnapshotConfig {
+        &self.snapshot_config
+    }
+
+    /// Directory holding this capture's artifacts (vm_state.bin's parent).
+    pub fn snapshot_dir(&self) -> &Path {
+        &self.snapshot_dir
+    }
+
+    /// Clone of the lease keeping the capture directory alive. Moved into
+    /// the detached startup-manifest recording/upload task, which can
+    /// outlive the synchronous publish flow.
+    pub(crate) fn snapshot_root_guard(&self) -> Arc<PersistentSnapshotRootGuard> {
+        Arc::clone(&self.snapshot_root)
     }
 }
 
@@ -363,7 +411,7 @@ impl SandboxBackend for FirecrackerSandbox {
             .map_err(SandboxCaptureError::from)?;
         let snapshot_dir = live_snapshot_root.path().join(Uuid::now_v7().to_string());
 
-        let (_, manifest) = match self.pause_to_dir(&snapshot_dir).await {
+        let (snapshot_config, manifest) = match self.pause_to_dir(&snapshot_dir).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return self
@@ -375,7 +423,10 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
-        Ok(CapturedSandboxSnapshot::new(manifest, live_snapshot_root))
+        Ok(CapturedSandboxSnapshot::new(
+            manifest,
+            FirecrackerCaptureArtifacts::new(snapshot_config, snapshot_dir, live_snapshot_root),
+        ))
     }
 
     /// Capture a snapshot without changing the sandbox's run state at the end.
@@ -419,9 +470,15 @@ impl SandboxBackend for FirecrackerSandbox {
         ))
     }
 
-    async fn capture_to_dir(&mut self, at: &Path) -> SandboxCaptureResult<SandboxSnapshotManifest> {
+    async fn capture_to_dir(
+        &mut self,
+        at: &Path,
+    ) -> SandboxCaptureResult<(
+        SandboxSnapshotManifest,
+        Option<Box<dyn std::any::Any + Send>>,
+    )> {
         match self.pause_to_dir(at).await {
-            Ok((_, manifest)) => Ok(manifest),
+            Ok((snapshot_config, manifest)) => Ok((manifest, Some(Box::new(snapshot_config)))),
             Err(error) => self.recover_capture_failure("capture", error).await,
         }
     }
@@ -714,6 +771,14 @@ impl FirecrackerSandbox {
             SandboxId::new(),
             snapshot.common.envd_access_token.clone(),
         )
+    }
+
+    /// The dedicated pack-recording memory device's id, when this sandbox was
+    /// started with `pack_recording = true`.
+    pub(crate) fn dedicated_mem_device_id(&self) -> Option<u32> {
+        self.mem_dedicated_device
+            .as_ref()
+            .map(|device| device.dev_id())
     }
 
     pub(crate) fn from_snapshot_config_with_override(
@@ -1316,6 +1381,8 @@ impl FirecrackerSandbox {
             mem_overlaybd_config,
             mem_virtual_size,
             managed_snapshot_root: None,
+            pack_recording: false,
+            memory_startup_pack: None,
         };
 
         debug!(
@@ -1408,6 +1475,13 @@ impl FirecrackerSandbox {
         if let Some(mem_device) = self.mem_ublk_device.take() {
             if let Err(e) = mem_device.release().await {
                 warn!(error = %e, "failed to release shared memory ublk device during stop");
+            }
+        }
+
+        // Dedicated pack-recording memory device: delete, never pool-release.
+        if let Some(device) = self.mem_dedicated_device.take() {
+            if let Err(e) = UblkDeviceManager::global().delete_device(&device).await {
+                warn!(error = %e, "failed to delete dedicated memory ublk device during stop");
             }
         }
 
@@ -1706,6 +1780,7 @@ impl FirecrackerSandbox {
             rootfs_runtime: None,
             mem_ublk_device: None,
             tools_ublk_device: None,
+            mem_dedicated_device: None,
             mem_snapshot_image_config_path: None,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
@@ -2080,20 +2155,24 @@ impl FirecrackerSandbox {
         }
 
         // ── Custom extension hook: start-resume ──
-        if let Some(client) = CustomExtensionClient::global() {
-            let slot = self
-                .network_slot
-                .as_ref()
-                .context("network slot must be allocated before start-resume hook")?;
-            let mut guard = CustomExtensionHookGuard::new(client, self.id);
-            guard
-                .start_resume(
-                    &slot.namespace_path().to_string_lossy(),
-                    slot.host_interaction_ip,
-                    config.common.custom_extension_params.as_ref(),
-                )
-                .await?;
-            self.custom_extension_hook_guard = Some(guard);
+        // Pack-recording VMs are throwaway recorders: hooks must not fire
+        // for them (the extension would see a phantom sandbox start/stop).
+        if !config.pack_recording {
+            if let Some(client) = CustomExtensionClient::global() {
+                let slot = self
+                    .network_slot
+                    .as_ref()
+                    .context("network slot must be allocated before start-resume hook")?;
+                let mut guard = CustomExtensionHookGuard::new(client, self.id);
+                guard
+                    .start_resume(
+                        &slot.namespace_path().to_string_lossy(),
+                        slot.host_interaction_ip,
+                        config.common.custom_extension_params.as_ref(),
+                    )
+                    .await?;
+                self.custom_extension_hook_guard = Some(guard);
+            }
         }
 
         let envd_base_url = format!(
@@ -2109,20 +2188,80 @@ impl FirecrackerSandbox {
             .memory_snapshot
             .overlaybd_global_config_path
             .clone();
-        let mem_device = UblkDeviceManager::global()
-            .get_or_create_shared_mem(
-                &UblkCreateSpec::Overlaybd {
+        let mem_device_path = if config.pack_recording {
+            // Pack-recording VMs get a dedicated, non-shared memory device:
+            // sharing one (or the block-device page cache behind it) would
+            // hide first-touch reads from the recorder.
+            let device = UblkDeviceManager::global()
+                .create_dedicated_mem_device(&UblkCreateSpec::Overlaybd {
                     image_config: config.mem_overlaybd_config.image_config_path.clone(),
-                    global_config: mem_global_config,
-                },
-                config.mem_virtual_size,
-            )
-            .await
-            .context("create or reuse shared memory ublk device for resume")?;
-        let mem_device_path = mem_device.device_path().to_path_buf();
-        self.mem_snapshot_image_config_path =
-            Some(config.mem_overlaybd_config.image_config_path.clone());
-        self.mem_ublk_device = Some(mem_device);
+                    global_config: mem_global_config.clone(),
+                })
+                .await
+                .context("create dedicated memory ublk device for pack recording")?;
+            let device_path = device.device_path().to_path_buf();
+            let device_id = device.dev_id();
+            // Store the device BEFORE any fallible step below: `stop()` owns
+            // its deletion, so an arming failure cannot leak the device.
+            self.mem_dedicated_device = Some(device);
+
+            // Arm the first-touch recorder BEFORE the snapshot loads so FC's
+            // load-time reads and the guest's first faults are all recorded.
+            let pack_config = &global_config.snapshot.memory_startup_pack;
+            let output = config
+                .vm_state_path
+                .parent()
+                .map(|dir| dir.join(crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT))
+                .context("pack recording requires a snapshot artifact dir")?;
+            UblkDeviceManager::global()
+                .start_pack_recording(
+                    device_id,
+                    &output,
+                    PackRecordingWindow {
+                        max_pages: u32::try_from(
+                            (pack_config.max_pack_bytes / overlaybd::startup_pack::PACK_PAGE_BYTES)
+                                .min(u64::from(overlaybd::startup_pack::MAX_PACK_PAGES)),
+                        )
+                        .unwrap_or(overlaybd::startup_pack::MAX_PACK_PAGES),
+                        min_window_ms: pack_config.record_min_window_ms,
+                        quiet_ms: pack_config.record_quiet_ms,
+                        max_window_ms: pack_config.record_max_window_ms,
+                    },
+                )
+                .await
+                .context("arm startup pack recorder")?;
+            device_path
+        } else {
+            // Register the startup manifest prefetch BEFORE opening the
+            // memory image: the prefetch then refills into the same cache
+            // the device opens, racing guest faults from the very first
+            // metadata read. Registration itself never blocks the resume.
+            if let Some(pack) = &config.memory_startup_pack {
+                UblkDeviceManager::global()
+                    .prefetch_startup_pack(
+                        &config.mem_overlaybd_config.image_config_path,
+                        &mem_global_config,
+                        pack,
+                    )
+                    .await;
+            }
+            let mem_device = UblkDeviceManager::global()
+                .get_or_create_shared_mem(
+                    &UblkCreateSpec::Overlaybd {
+                        image_config: config.mem_overlaybd_config.image_config_path.clone(),
+                        global_config: mem_global_config.clone(),
+                    },
+                    config.mem_virtual_size,
+                )
+                .await
+                .context("create or reuse shared memory ublk device for resume")?;
+            let device_path = mem_device.device_path().to_path_buf();
+
+            self.mem_snapshot_image_config_path =
+                Some(config.mem_overlaybd_config.image_config_path.clone());
+            self.mem_ublk_device = Some(mem_device);
+            device_path
+        };
 
         if needs_socket_wait {
             self.fc_instance
@@ -3095,6 +3234,7 @@ mod tests {
             .expect("fresh config has a rootfs")
             .image_config_path = "snapshot/rootfs/image.json".into();
         let state = FirecrackerPausedState::new(FirecrackerSnapshotConfig {
+            memory_startup_pack: None,
             common,
             vm_state_path: "snapshot/vm_state.bin".into(),
             mem_overlaybd_config: OverlaybdConfig {
@@ -3104,6 +3244,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            pack_recording: false,
         });
 
         assert_eq!(
@@ -3135,6 +3276,8 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            pack_recording: false,
+            memory_startup_pack: None,
         };
 
         let child = FirecrackerSandbox::from_snapshot_config_with_override(
@@ -3178,6 +3321,7 @@ mod tests {
             .expect("fresh config has a rootfs")
             .image_config_path = rootfs_image_path;
         let mut value = serde_json::to_value(FirecrackerSnapshotConfig {
+            memory_startup_pack: None,
             common,
             vm_state_path,
             mem_overlaybd_config: OverlaybdConfig {
@@ -3187,6 +3331,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            pack_recording: false,
         })?;
         let common = value["common"]
             .as_object_mut()
