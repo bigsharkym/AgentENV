@@ -209,13 +209,6 @@ pub struct FirecrackerSandbox {
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
 
-/// Firecracker-specific captured snapshot payload kept alive for publication.
-#[derive(Debug)]
-pub struct FirecrackerCapturedSnapshot {
-    manifest: SandboxSnapshotManifest,
-    _snapshot_root: Arc<PersistentSnapshotRootGuard>,
-}
-
 #[derive(Clone, Debug)]
 pub struct FirecrackerPausedState {
     snapshot_config: FirecrackerSnapshotConfig,
@@ -286,22 +279,6 @@ impl PausedSandboxState for FirecrackerPausedState {
         Ok(CapturedSandboxSnapshot::new(
             FirecrackerCapturedSnapshot::new(manifest, dummy_guard),
         ))
-    }
-}
-
-impl FirecrackerCapturedSnapshot {
-    pub(crate) fn new(
-        manifest: SandboxSnapshotManifest,
-        snapshot_root: Arc<PersistentSnapshotRootGuard>,
-    ) -> Self {
-        Self {
-            manifest,
-            _snapshot_root: snapshot_root,
-        }
-    }
-
-    pub fn manifest(&self) -> &SandboxSnapshotManifest {
-        &self.manifest
     }
 }
 
@@ -398,9 +375,7 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
-        Ok(CapturedSandboxSnapshot::new(
-            FirecrackerCapturedSnapshot::new(manifest, live_snapshot_root),
-        ))
+        Ok(CapturedSandboxSnapshot::new(manifest, live_snapshot_root))
     }
 
     /// Capture a snapshot without changing the sandbox's run state at the end.
