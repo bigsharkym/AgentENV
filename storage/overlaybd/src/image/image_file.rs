@@ -1264,11 +1264,11 @@ mod tests {
                 .expect("head response");
         }
         let Some((start, end)) = parse_request_range(&headers) else {
+            // The real UUID facade requires Range, including for URL probes.
             return Response::builder()
-                .status(HttpStatusCode::OK)
-                .header(reqwest::header::CONTENT_LENGTH, len.to_string())
-                .body(Body::from(state.blob.as_ref().clone()))
-                .expect("full response");
+                .status(HttpStatusCode::BAD_REQUEST)
+                .body(Body::from("missing Range header"))
+                .expect("missing range response");
         };
         let start = start.min(len.saturating_sub(1));
         let end = end.min(len.saturating_sub(1));
