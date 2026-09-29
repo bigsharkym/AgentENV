@@ -1,7 +1,7 @@
 //! CTP (connection management): dynamic transport-channel establishment.
 //!
-//! Note: Despite the module name, all transports now use the RTP plane
-//! (`tp_type = URMA_RTP`, priority 0) on UB hardware, which supports both
+//! Note: Despite the module name, all transports now use the CTP plane
+//! (`tp_type = URMA_CTP`, priority 0) on UB hardware, which supports both
 //! one-sided READ/WRITE and two-sided SEND/RECV. The module name is kept
 //! for stability; the manager itself is transport-agnostic — it just
 //! imports remote jetties and (for RC-style transports) binds them.

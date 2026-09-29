@@ -17,6 +17,12 @@
 //!     | <-- post_send(response: {descriptor})  |
 //!     |  RECV completion (len = response size) |
 //! ```
+//!
+//! The server keeps a pool of RECV buffers pre-posted on its serve jetty and
+//! re-posts each buffer as soon as its request has been extracted, so a
+//! burst of concurrent requests never hits an empty RECV queue (which would
+//! RNR-fail the senders). Responses are sent from a pooled set of buffers,
+//! one handler task per request.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +33,7 @@ use tracing::{debug, instrument, warn};
 
 use super::context::UrmaContext;
 use super::ctp::PeerConnectionManager;
-use super::ops::{JettyId, MsgWr, RegisteredSeg, TargetJettyHandle};
+use super::ops::{Completion, JettyId, MsgWr, RegisteredSeg, TargetJettyHandle};
 use super::URMA_BACKEND_ID;
 use crate::p2p::error::{Error, Result};
 use crate::p2p::types::{P2pArtifactDescriptor, P2pArtifactKey, P2pPeer};
@@ -286,14 +292,23 @@ impl RemoteCatalog for UrmaCatalog {
         }
 
         let buffers = vec![send_buf, recv_buf];
-        self.release(buffers);
+        self.release(buffers).await;
         result
     }
 }
 
-/// Server side of the catalog protocol: pre-posts a RECV on the serve
-/// jetty, resolves requests against the local registry and SENDs back the
-/// descriptor (or `null`).
+/// Number of RECV buffers pre-posted on the serve jetty. Incoming SENDs
+/// land in any posted buffer; keeping several in flight at all times
+/// avoids RNR (receiver-not-ready) NAKs while earlier requests are being
+/// processed. Must stay below the JFR depth.
+const SERVER_RECV_POOL_SIZE: usize = 16;
+
+/// Server side of the catalog protocol: pre-posts a pool of RECV buffers
+/// on the serve jetty, resolves requests against the local registry and
+/// SENDs back the descriptor (or `null`). Each request is answered in its
+/// own task, and a RECV buffer is re-posted as soon as its message has
+/// been extracted, so the jetty never runs out of posted RECVs while a
+/// response is in flight.
 pub struct CatalogServer;
 
 impl CatalogServer {
@@ -306,124 +321,254 @@ impl CatalogServer {
         resolve: Arc<dyn Fn(&str) -> Option<P2pArtifactDescriptor> + Send + Sync>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut recv_buf = match ControlBuffer::new(&context) {
-                Ok(buf) => buf,
-                Err(err) => {
-                    warn!(error = %err, "urma: catalog server failed to allocate buffer");
-                    return;
-                }
-            };
-            let mut send_buf = match ControlBuffer::new(&context) {
-                Ok(buf) => buf,
-                Err(err) => {
-                    warn!(error = %err, "urma: catalog server failed to allocate buffer");
-                    return;
-                }
-            };
-            debug!("urma: catalog server listening on serve jetty");
             // Imported requester jettys, cached so repeat queries from the
-            // same peer do not re-import. Entries live until shutdown (the
-            // whole context is torn down then).
-            let mut client_jetties: HashMap<JettyId, TargetJettyHandle> = HashMap::new();
+            // same peer do not re-import. Shared with the per-request
+            // handler tasks; entries live until shutdown (the whole context
+            // is torn down then).
+            let client_jetties: Arc<std::sync::Mutex<HashMap<JettyId, TargetJettyHandle>>> =
+                Arc::new(std::sync::Mutex::new(HashMap::new()));
+            // Response buffers, reused across requests (segment registration
+            // is not free; pooling avoids per-request register churn).
+            let send_pool: Arc<tokio::sync::Mutex<Vec<ControlBuffer>>> =
+                Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+            // Pre-post the whole RECV pool so concurrent requests always
+            // find a landing buffer.
+            let mut recvs: Vec<RecvFuture> = Vec::with_capacity(SERVER_RECV_POOL_SIZE);
+            for _ in 0..SERVER_RECV_POOL_SIZE {
+                let buf = match ControlBuffer::new(&context) {
+                    Ok(buf) => buf,
+                    Err(err) => {
+                        warn!(error = %err, "urma: catalog server failed to allocate buffer");
+                        return;
+                    }
+                };
+                match post_recv_buf(&context, serve_jetty, buf) {
+                    Ok(fut) => recvs.push(fut),
+                    Err(err) => {
+                        warn!(error = %err, "urma: catalog server post_recv failed");
+                        return;
+                    }
+                }
+            }
+
+            debug!(
+                buffers = SERVER_RECV_POOL_SIZE,
+                "urma: catalog server listening on serve jetty"
+            );
 
             loop {
-                // 1. Post the request landing buffer.
-                let recv_wr_id = context.alloc_wr_id();
-                let recv_rx = context.subscribe(recv_wr_id);
-                if let Err(err) = context.ops().post_recv(
-                    serve_jetty,
-                    &MsgWr {
-                        wr_id: recv_wr_id,
-                        // RECV ignores the target; fill a placeholder.
-                        tjetty: TargetJettyHandle(0),
-                        local_tseg: recv_buf.registered.tseg,
-                        local_va: recv_buf.registered.local_va,
-                        len: CATALOG_BUF_SIZE as u32,
-                    },
-                ) {
-                    warn!(error = %err, "urma: catalog server post_recv failed");
-                    return;
-                }
+                // 1. Wait for any outstanding RECV to complete; the rest
+                // stay posted, absorbing concurrent requests.
+                let ((buf, cqe_res), _idx, rest) = futures::future::select_all(recvs).await;
+                recvs = rest;
 
-                // 2. Await the request.
-                let cqe = match recv_rx.await {
+                let cqe = match cqe_res {
                     Ok(cqe) => cqe,
                     Err(_) => {
+                        // Completion channel closed: context is shutting down.
                         debug!("urma: catalog server shutting down (channel closed)");
                         return;
                     }
                 };
                 if cqe.status != 0 {
+                    // One failed RECV must not take the server down; put
+                    // the buffer back into rotation.
                     warn!(status = cqe.status, "urma: catalog server recv failed");
-                    return;
-                }
-                let request: CatalogRequest = match serde_json::from_slice(
-                    &recv_buf.as_slice()[..cqe.len as usize],
-                ) {
-                    Ok(req) => req,
-                    Err(err) => {
-                        warn!(error = %err, "urma: catalog server got malformed request");
-                        continue;
+                    match post_recv_buf(&context, serve_jetty, buf) {
+                        Ok(fut) => recvs.push(fut),
+                        Err(err) => {
+                            warn!(error = %err, "urma: catalog server post_recv failed");
+                            return;
+                        }
                     }
-                };
+                    continue;
+                }
 
+                // 2. Extract the request before reposting: the next
+                // incoming message overwrites the buffer as soon as it is
+                // reposted.
+                let request: CatalogRequest =
+                    match serde_json::from_slice(&buf.as_slice()[..cqe.len as usize]) {
+                        Ok(req) => req,
+                        Err(err) => {
+                            warn!(error = %err, "urma: catalog server got malformed request");
+                            match post_recv_buf(&context, serve_jetty, buf) {
+                                Ok(fut) => recvs.push(fut),
+                                Err(err) => {
+                                    warn!(error = %err, "urma: catalog server post_recv failed");
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                    };
                 // The requester's jetty (from the RECV completion) is the
                 // target the response SEND must address (RM is
                 // connectionless, every SEND carries its target).
                 let Some(client) = cqe.from else {
                     warn!("urma: catalog request without a sender jetty id");
-                    continue;
-                };
-                let tjetty = match client_jetties.entry(client) {
-                    std::collections::hash_map::Entry::Occupied(occupied) => *occupied.get(),
-                    std::collections::hash_map::Entry::Vacant(vacant) => {
-                        match context.ops().import_jetty(context.handle(), vacant.key()) {
-                            Ok(handle) => *vacant.insert(handle),
-                            Err(err) => {
-                                warn!(error = %err, "urma: catalog server failed to import client jetty");
-                                continue;
-                            }
+                    match post_recv_buf(&context, serve_jetty, buf) {
+                        Ok(fut) => recvs.push(fut),
+                        Err(err) => {
+                            warn!(error = %err, "urma: catalog server post_recv failed");
+                            return;
                         }
                     }
+                    continue;
                 };
 
-                // 3. Resolve and send the response.
-                let response = CatalogResponse {
-                    descriptor: resolve(&request.key),
-                };
-                let send_len = match send_buf.write_json(&response) {
-                    Ok(len) => len,
+                // 3. Repost the buffer immediately: handling this request
+                // must never leave the jetty without posted RECVs.
+                match post_recv_buf(&context, serve_jetty, buf) {
+                    Ok(fut) => recvs.push(fut),
                     Err(err) => {
-                        warn!(error = %err, "urma: catalog server response encode failed");
-                        continue;
-                    }
-                };
-                let send_wr_id = context.alloc_wr_id();
-                let send_rx = context.subscribe(send_wr_id);
-                if let Err(err) = context.ops().post_send(
-                    serve_jetty,
-                    &MsgWr {
-                        wr_id: send_wr_id,
-                        tjetty,
-                        local_tseg: send_buf.registered.tseg,
-                        local_va: send_buf.registered.local_va,
-                        len: send_len as u32,
-                    },
-                ) {
-                    warn!(error = %err, "urma: catalog server post_send failed");
-                    return;
-                }
-                match send_rx.await {
-                    Ok(cqe) if cqe.status == 0 => {}
-                    Ok(cqe) => {
-                        warn!(status = cqe.status, "urma: catalog server send failed");
+                        warn!(error = %err, "urma: catalog server post_recv failed");
                         return;
                     }
-                    Err(_) => return,
                 }
+
+                // 4. Answer in a dedicated task so a slow response SEND
+                // never stalls the RECV loop.
+                tokio::spawn(handle_request(
+                    context.clone(),
+                    serve_jetty,
+                    client_jetties.clone(),
+                    send_pool.clone(),
+                    resolve.clone(),
+                    client,
+                    request,
+                ));
             }
         })
     }
+}
+
+/// A posted RECV buffer as a future: resolves with the buffer back plus
+/// its completion. The buffer must stay untouched until the future
+/// resolves (the hardware may be writing into it).
+type RecvFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = (
+                    ControlBuffer,
+                    std::result::Result<Completion, tokio::sync::oneshot::error::RecvError>,
+                ),
+            > + Send,
+    >,
+>;
+
+/// Post `buf` as a RECV on the jetty and return a future that hands the
+/// buffer back together with its completion. Fails if the post itself is
+/// rejected.
+fn post_recv_buf(
+    context: &Arc<UrmaContext>,
+    jetty: super::ops::JettyHandle,
+    buf: ControlBuffer,
+) -> Result<RecvFuture> {
+    let wr_id = context.alloc_wr_id();
+    let rx = context.subscribe(wr_id);
+    context
+        .ops()
+        .post_recv(
+            jetty,
+            &MsgWr {
+                wr_id,
+                // RECV ignores the target; fill a placeholder.
+                tjetty: TargetJettyHandle(0),
+                local_tseg: buf.registered.tseg,
+                local_va: buf.registered.local_va,
+                len: CATALOG_BUF_SIZE as u32,
+            },
+        )
+        .map_err(|e| Error::internal_message("urma post_recv", e))?;
+    Ok(Box::pin(async move {
+        let cqe = rx.await;
+        (buf, cqe)
+    }))
+}
+
+/// Resolve one catalog request and SEND the response back to `client`.
+async fn handle_request(
+    context: Arc<UrmaContext>,
+    serve_jetty: super::ops::JettyHandle,
+    client_jetties: Arc<std::sync::Mutex<HashMap<JettyId, TargetJettyHandle>>>,
+    send_pool: Arc<tokio::sync::Mutex<Vec<ControlBuffer>>>,
+    resolve: Arc<dyn Fn(&str) -> Option<P2pArtifactDescriptor> + Send + Sync>,
+    client: JettyId,
+    request: CatalogRequest,
+) {
+    // Import the requester's jetty once per client (RM is connectionless,
+    // every SEND carries its target).
+    let tjetty = {
+        let mut jetties = client_jetties.lock().unwrap();
+        if let Some(handle) = jetties.get(&client) {
+            *handle
+        } else {
+            match context.ops().import_jetty(context.handle(), &client) {
+                Ok(handle) => {
+                    jetties.insert(client, handle);
+                    handle
+                }
+                Err(err) => {
+                    warn!(error = %err, "urma: catalog server failed to import client jetty");
+                    return;
+                }
+            }
+        }
+    };
+
+    // Lease a response buffer (pool grows on demand, reuses thereafter).
+    let mut send_buf = {
+        let mut pool = send_pool.lock().await;
+        match pool.pop() {
+            Some(buf) => buf,
+            None => match ControlBuffer::new(&context) {
+                Ok(buf) => buf,
+                Err(err) => {
+                    warn!(error = %err, "urma: catalog server failed to allocate send buffer");
+                    return;
+                }
+            },
+        }
+    };
+
+    let response = CatalogResponse {
+        descriptor: resolve(&request.key),
+    };
+    let send_len = match send_buf.write_json(&response) {
+        Ok(len) => len,
+        Err(err) => {
+            warn!(error = %err, "urma: catalog server response encode failed");
+            send_pool.lock().await.push(send_buf);
+            return;
+        }
+    };
+    let send_wr_id = context.alloc_wr_id();
+    let send_rx = context.subscribe(send_wr_id);
+    if let Err(err) = context.ops().post_send(
+        serve_jetty,
+        &MsgWr {
+            wr_id: send_wr_id,
+            tjetty,
+            local_tseg: send_buf.registered.tseg,
+            local_va: send_buf.registered.local_va,
+            len: send_len as u32,
+        },
+    ) {
+        warn!(error = %err, "urma: catalog server post_send failed");
+        send_pool.lock().await.push(send_buf);
+        return;
+    }
+    // The WR references `send_buf` until its completion arrives (the
+    // transport's error timeout guarantees one); only then may the buffer
+    // be reused.
+    match send_rx.await {
+        Ok(cqe) if cqe.status == 0 => {}
+        Ok(cqe) => warn!(status = cqe.status, "urma: catalog server send failed"),
+        Err(_) => debug!("urma: catalog server send completion channel closed"),
+    }
+    send_pool.lock().await.push(send_buf);
 }
 
 #[cfg(test)]

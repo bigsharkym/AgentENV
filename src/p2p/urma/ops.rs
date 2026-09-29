@@ -571,11 +571,14 @@ impl UrmaOps for RealUrmaOps {
                 trans_mode: ffi::URMA_TM_RM,
                 policy: 0,
                 type_: ffi::URMA_JETTY,
-                // RTP plane: required for one-sided READ/WRITE on UB hardware.
-                // CTP (priority 6) only supports SEND/RECV and returns
-                // URMA_CR_ACK_TIMEOUT_ERR (status 9) for one-sided operations.
+                // CTP plane: required for RM import_jetty on UB hardware.
+                // RTP import returns EPERM (errno=1) because UB RM mode
+                // only exposes the CTP plane (rm_tp_cap.rtp=0). CTP import
+                // supports both one-sided READ/WRITE and two-sided SEND/RECV
+                // (verified empirically: READ 1MiB / WRITE 4KiB both succeed
+                // with status=0 on CTP).
                 flag: 0,
-                tp_type: ffi::URMA_RTP,
+                tp_type: ffi::URMA_CTP,
             };
             let mut token = ffi::urma_token_t { token: 0 };
             let tjetty = Self::check_non_null(
