@@ -32,6 +32,21 @@ const DEFAULT_UPLOAD_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const RETRY_BACKOFF: Duration = Duration::from_millis(1);
 const HTTP_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// Whether two URL strings share the same origin (scheme + host + port).
+/// Used to avoid wrapping a URL that already points at the local p2p facade
+/// into the accelerate address (which would make the facade answer 400).
+fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(ua), Ok(ub)) = (Url::parse(a), Url::parse(b)) else {
+        return false;
+    };
+    let (Some(ha), Some(hb)) = (ua.host_str(), ub.host_str()) else {
+        return false;
+    };
+    ua.scheme() == ub.scheme()
+        && ha == hb
+        && ua.port_or_known_default() == ub.port_or_known_default()
+}
+
 #[derive(Debug, Clone)]
 pub struct RegistryFsV2Options {
     pub timeout: Duration,
@@ -702,8 +717,17 @@ impl RegistryFSImplV2 {
         if addr.is_empty() {
             return None;
         }
+        // A URL that already points at the local p2p facade itself (e.g. the
+        // p2p-uuid facade URL used when opening P2P layers) must NOT be wrapped
+        // into {addr}/{actual_url}. The facade would treat its own address as
+        // the origin and answer HTTP 400, which forces the caller to fall back
+        // to the OSS repo_blob_url. Skip wrapping when the origins match.
+        if same_origin(actual_url, &addr) {
+            return None;
+        }
         Some(format!("{}/{}", addr.trim_end_matches('/'), actual_url))
     }
+
 
     fn build_range_header(offset: u64, count: usize) -> Result<String> {
         let range_end = offset

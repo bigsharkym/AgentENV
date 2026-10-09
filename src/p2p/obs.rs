@@ -11,6 +11,15 @@
 //! stream's *first* poll window only where the transport is synchronous;
 //! streaming time is attributed via the byte counters.
 //!
+//! Data-plane granularity (urma one-sided READ path): every bounce-window
+//! `read_range` call is recorded as a latency sample plus bytes
+//! (`agentenv_p2p_read_window_seconds` / `..._read_window_bytes_total`),
+//! and every remote chunk stream records its end-to-end duration, bytes and
+//! terminal status (`agentenv_p2p_stream_duration_seconds` /
+//! `..._stream_bytes_total`, `status` = ok|error|dropped) — the streamed
+//! `fetch_byte_range` path is otherwise invisible to the op timer, which
+//! only covers setup.
+//!
 //! p95 comparison (Prometheus):
 //!
 //! ```text
@@ -74,6 +83,47 @@ pub(crate) fn record_fetch_bytes(backend: &'static str, bytes: u64) {
     metrics::counter!(
         "agentenv_p2p_fetch_bytes_total",
         "backend" => backend,
+    )
+    .increment(bytes);
+}
+
+/// Record one one-sided READ window: a single `read_range` call pulling at
+/// most one bounce buffer of bytes (internally chunked into serial READ
+/// WRs). This is the innermost data-plane primitive; throughput is
+/// `read_window_bytes_total / read_window_seconds` (sum over windows).
+pub(crate) fn record_read_window(backend: &'static str, bytes: u64, duration_secs: f64) {
+    metrics::histogram!(
+        "agentenv_p2p_read_window_seconds",
+        "backend" => backend,
+    )
+    .record(duration_secs);
+    metrics::counter!(
+        "agentenv_p2p_read_window_bytes_total",
+        "backend" => backend,
+    )
+    .increment(bytes);
+}
+
+/// Record one remote chunk stream lifecycle (setup through the last
+/// delivered chunk): end-to-end duration, delivered bytes and terminal
+/// status. Covers the streamed `fetch_byte_range` path whose op timer only
+/// captures call setup.
+pub(crate) fn record_stream(
+    backend: &'static str,
+    status: &'static str,
+    bytes: u64,
+    duration_secs: f64,
+) {
+    metrics::histogram!(
+        "agentenv_p2p_stream_duration_seconds",
+        "backend" => backend,
+        "status" => status,
+    )
+    .record(duration_secs);
+    metrics::counter!(
+        "agentenv_p2p_stream_bytes_total",
+        "backend" => backend,
+        "status" => status,
     )
     .increment(bytes);
 }

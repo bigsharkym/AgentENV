@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -465,11 +465,35 @@ impl UrmaP2pTransport {
             if len == 0 {
                 return;
             }
+            let stream_start = Instant::now();
+            let mut streamed: u64 = 0;
+            let mut status: &'static str = "ok";
+            let record_stream = |status: &'static str, streamed: u64, started: Instant| {
+                let duration = started.elapsed();
+                crate::p2p::obs::record_stream(
+                    URMA_BACKEND_ID,
+                    status,
+                    streamed,
+                    duration.as_secs_f64(),
+                );
+                debug!(
+                    bytes = streamed,
+                    elapsed_ms = duration.as_millis() as u64,
+                    mbps = if duration.as_secs_f64() > 0.0 {
+                        streamed as f64 / duration.as_secs_f64() / (1024.0 * 1024.0)
+                    } else {
+                        0.0
+                    },
+                    status,
+                    "urma data stream finished"
+                );
+            };
             let window = len.min(MAX_BOUNCE_WINDOW);
             // URMA requires page-aligned buffers for register_seg.
             let layout = std::alloc::Layout::from_size_align(window as usize, 4096).unwrap();
             let bounce_addr = unsafe { std::alloc::alloc(layout) as usize };
             if bounce_addr == 0 {
+                record_stream("error", streamed, stream_start);
                 let _ = tx
                     .send(Err(Error::Internal(anyhow::anyhow!("urma: bounce alloc failed"))))
                     .await;
@@ -483,6 +507,7 @@ impl UrmaP2pTransport {
                 Ok(r) => r,
                 Err(e) => {
                     unsafe { std::alloc::dealloc(bounce_addr as *mut u8, layout) };
+                    record_stream("error", streamed, stream_start);
                     let _ = tx
                         .send(Err(Error::internal_message("urma register bounce", e)))
                         .await;
@@ -493,20 +518,45 @@ impl UrmaP2pTransport {
             let mut pos = offset;
             while remaining > 0 {
                 let chunk_len = remaining.min(window);
+                let read_start = Instant::now();
                 if let Err(err) = reader
                     .read_range(&locator, pos, chunk_len, registered.tseg, registered.ubva, fetch_timeout)
                     .await
                 {
+                    status = "error";
+                    record_stream(status, streamed, stream_start);
                     let _ = tx.send(Err(err)).await;
                     break;
                 }
+                crate::p2p::obs::record_read_window(
+                    URMA_BACKEND_ID,
+                    chunk_len,
+                    read_start.elapsed().as_secs_f64(),
+                );
+                let read_elapsed = read_start.elapsed();
+                debug!(
+                    bytes = chunk_len,
+                    elapsed_ms = read_elapsed.as_millis() as u64,
+                    mbps = if read_elapsed.as_secs_f64() > 0.0 {
+                        chunk_len as f64 / read_elapsed.as_secs_f64() / (1024.0 * 1024.0)
+                    } else {
+                        0.0
+                    },
+                    "urma read window done"
+                );
+                streamed += chunk_len;
                 let end = chunk_len as usize;
                 let bounce_slice = unsafe { std::slice::from_raw_parts(bounce_addr as *const u8, end) };
                 if tx.send(Ok(Bytes::copy_from_slice(bounce_slice))).await.is_err() {
-                    break; // consumer dropped the stream
+                    status = "dropped"; // consumer dropped the stream
+                    record_stream(status, streamed, stream_start);
+                    break;
                 }
                 pos += chunk_len;
                 remaining -= chunk_len;
+            }
+            if status == "ok" {
+                record_stream(status, streamed, stream_start);
             }
             let _ = context.ops().unregister_seg(registered.tseg);
             unsafe { std::alloc::dealloc(bounce_addr as *mut u8, layout) };
@@ -608,16 +658,37 @@ impl UrmaP2pTransport {
             }
         };
         for peer in peers.iter().filter(|p| p.endpoint.backend == URMA_BACKEND_ID) {
-            match self.catalog.query(peer, key).await {
-                Ok(Some(descriptor)) => {
-                    debug!(peer = %peer.node_id, "urma lookup found remote descriptor");
-                    return Ok(Some(descriptor));
+            // Retry up to 3 times with 300ms intervals to cover the URMA SEND
+            // cold-start window (~1s) where the first SEND after import_jetty
+            // is silently dropped by the UB hardware.  The hardware-level
+            // rnr_retry (7) does not help here because bind_jetty itself
+            // succeeds — only the subsequent SEND is dropped.
+            let mut last_err = None;
+            for attempt in 0..3u32 {
+                match self.catalog.query(peer, key).await {
+                    Ok(Some(descriptor)) => {
+                        debug!(
+                            peer = %peer.node_id,
+                            attempt,
+                            "urma lookup found remote descriptor"
+                        );
+                        return Ok(Some(descriptor));
+                    }
+                    Ok(None) => break, // peer confirmed absence; no point retrying
+                    Err(err) => {
+                        last_err = Some(err);
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                    }
                 }
-                Ok(None) => continue,
-                Err(err) => {
-                    warn!(peer = %peer.node_id, error = %err, "urma: catalog query failed");
-                    continue;
-                }
+            }
+            if let Some(err) = last_err {
+                warn!(
+                    peer = %peer.node_id,
+                    error = %err,
+                    "urma: catalog query failed after 3 retries"
+                );
             }
         }
         Ok(None)
