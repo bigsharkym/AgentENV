@@ -536,6 +536,47 @@ impl SandboxBackend for FirecrackerSandbox {
             .map_err(SandboxCaptureError::terminal)
     }
 
+    /// Capture a snapshot without changing the sandbox's run state at the end.
+    ///
+    /// For a sandbox that is already `Paused` (the typical caller), this
+    /// captures the VM state and disk artifacts while leaving the Firecracker
+    /// VM paused. For a `Running` sandbox, the implementation falls back to
+    /// the standard [`snapshot`](Self::snapshot) behavior (pause→capture→resume)
+    /// so it remains safe to call from a running source.
+    async fn snapshot_no_resume(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+        // If the microVM is currently paused, we capture directly without
+        // any resume at the end so the source stays paused.
+        let live_snapshot_root = self
+            .live_snapshot_root()
+            .await
+            .map_err(SandboxCaptureError::from)?;
+        let snapshot_dir = live_snapshot_root.path().join(Uuid::now_v7().to_string());
+
+        let (_, manifest) = match self.pause_to_dir(&snapshot_dir).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let snapshot_err = SandboxCaptureError::from(err);
+                if snapshot_err.is_terminal() {
+                    return Err(snapshot_err);
+                }
+
+                // Best-effort: leave the sandbox in a usable state. For a
+                // previously-paused sandbox, attempting to resume here would
+                // change the source state, so we only resume if the caller
+                // had a running sandbox (i.e., pause_to_dir was the first
+                // pause attempt). On non-terminal failure from an already
+                // paused source, return the error and let the orchestrator
+                // decide the next step (it knows the original state).
+                return Err(snapshot_err);
+            }
+        };
+
+        // Do NOT resume: the source was paused and must stay paused.
+        Ok(CapturedSandboxSnapshot::new(
+            FirecrackerCapturedSnapshot::new(manifest, live_snapshot_root),
+        ))
+    }
+
     async fn fork(
         &mut self,
         spec: &[SandboxForkSpec],

@@ -800,6 +800,12 @@ impl Sandboxes<()> for ApiImpl {
             // flow uses start_paused=true.
             start_paused: false,
             volume_mounts,
+            // Cold-create from OCI image always generates a fresh sandbox ID;
+            // explicit IDs are only honored by the snapshot-based create path.
+            sandbox_id: None,
+            // Cold-create never starts paused; only the snapshot-based migrate
+            // flow uses start_paused=true.
+            start_paused: false,
         };
 
         match timer
@@ -1125,6 +1131,26 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
+        // Parse the optional caller-provided sandboxID. Used by the gateway
+        // migrate flow to preserve the source sandbox's ID on the target
+        // node. An empty string is treated as "not provided".
+        let explicit_sandbox_id = match body.sandbox_id.as_deref() {
+            Some(s) if !s.is_empty() => match SandboxId::parse_str(s) {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                        400,
+                        format!("invalid sandboxID: {err}"),
+                    )));
+                }
+            },
+            _ => None,
+        };
+
+        // Parse the optional startPaused flag. Used by the gateway
+        // migrate-paused flow so the target sandbox is created directly in
+        // the Paused state, mirroring the source's pre-migration state.
+        let start_paused = body.start_paused.unwrap_or(false);
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
             extra_drives: volume_drives,
@@ -1146,6 +1172,8 @@ impl Sandboxes<()> for ApiImpl {
             sandbox_id: explicit_sandbox_id,
             start_paused,
             volume_mounts,
+            sandbox_id: explicit_sandbox_id,
+            start_paused,
         };
 
         match timer
