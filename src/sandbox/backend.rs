@@ -296,24 +296,6 @@ pub trait SandboxBackend: Send + 'static {
     /// barrier without capturing rootfs, memory, or VM state.
     async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()>;
 
-    /// Capture a persistent snapshot from a sandbox without changing its run
-    /// state at the end.
-    ///
-    /// For a sandbox that is already `Paused`, this captures the snapshot and
-    /// leaves the sandbox `Paused` (no implicit resume). For a `Running`
-    /// sandbox the behavior is identical to [`snapshot`](Self::snapshot):
-    /// the implementation may briefly pause to capture and then resume.
-    ///
-    /// The orchestrator uses this when migrating a paused sandbox so the
-    /// source's paused state is preserved across the snapshot capture.
-    ///
-    /// [`SandboxCaptureError::Terminal`] indicates snapshot capture mutated
-    /// the live runtime before failing, so callers must not keep treating
-    /// the sandbox as safely runnable.
-    async fn snapshot_no_resume(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
-        self.snapshot().await
-    }
-
     /// Fork this running sandbox into ready child backends.
     ///
     /// The outer error is reserved for failures before child startup begins.

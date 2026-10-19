@@ -479,10 +479,6 @@ where
             volume_mounts,
             extra_drives: launch_extra_drives,
             extra_drives_in_snapshot,
-            start_paused,
-            // sandbox_id has already been consumed by the outer create_sandbox
-            // wrapper; the inner function receives the resolved id via parameter.
-            sandbox_id: _,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");

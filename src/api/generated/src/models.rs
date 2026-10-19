@@ -3458,7 +3458,6 @@ impl std::str::FromStr for NewSandbox {
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub start_paused: Vec<bool>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
-            pub start_paused: Vec<bool>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -3582,7 +3581,6 @@ impl std::str::FromStr for NewSandbox {
             )?,
             start_paused: intermediate_rep.start_paused.into_iter().next(),
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
-            start_paused: intermediate_rep.start_paused.into_iter().next(),
         })
     }
 }
