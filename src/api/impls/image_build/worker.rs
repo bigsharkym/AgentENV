@@ -182,6 +182,8 @@ impl ApiImpl {
                     secure: true,
                     custom_extension_params: None,
                     volume_mounts: mounts,
+                    sandbox_id: None,
+                    start_paused: false,
                 },
             )
             .await?;

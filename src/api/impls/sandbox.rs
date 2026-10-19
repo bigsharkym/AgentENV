@@ -1247,6 +1247,8 @@ impl Sandboxes<()> for ApiImpl {
             custom_extension_params: body.custom_extension_params.clone(),
             mcp: body.mcp.clone(),
             volume_mounts: body.volume_mounts.clone(),
+            sandbox_id: None,
+            start_paused: None,
         };
         Ok(
             match self

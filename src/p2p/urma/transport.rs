@@ -35,7 +35,7 @@ use crate::p2p::error::{Error, Result};
 use crate::p2p::transport::P2pTransport;
 use crate::p2p::types::{
     P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProvider, P2pArtifactProviderHint,
-    P2pEndpoint, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
+    P2pEndpoint, P2pFetchOptions, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
 };
 use crate::p2p::P2pByteStream;
 
@@ -712,7 +712,12 @@ impl P2pTransport for UrmaP2pTransport {
     }
 
     #[instrument(skip(self, descriptor), fields(key = %descriptor.key, destination = %destination.display()))]
-    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64> {
+    async fn fetch_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        destination: &Path,
+        _options: P2pFetchOptions,
+    ) -> Result<u64> {
         let timer = crate::p2p::obs::OpTimer::start(URMA_BACKEND_ID, crate::p2p::obs::OP_FETCH);
         let result = self.fetch_inner(descriptor, destination).await;
         if let Ok(size) = &result {
@@ -723,7 +728,11 @@ impl P2pTransport for UrmaP2pTransport {
     }
 
     #[instrument(skip(self, descriptor), fields(key = %descriptor.key))]
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+    async fn fetch_bytes_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        _options: P2pFetchOptions,
+    ) -> Result<Bytes> {
         let timer =
             crate::p2p::obs::OpTimer::start(URMA_BACKEND_ID, crate::p2p::obs::OP_FETCH_BYTES);
         let result = self.fetch_bytes_inner(descriptor).await;

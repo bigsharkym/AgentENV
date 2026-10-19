@@ -19,7 +19,7 @@ use tracing::{info, instrument, warn};
 use super::error::{Error, Result};
 use super::transport::P2pTransport;
 use super::types::{
-    P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProviderHint, P2pEndpoint,
+    P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProviderHint, P2pEndpoint, P2pFetchOptions,
     P2pPublishRequest,
 };
 use super::P2pByteStream;
@@ -67,29 +67,50 @@ impl P2pTransport for CompositeP2pTransport {
     }
 
     #[instrument(skip(self, descriptor), fields(key = %descriptor.key, destination = %destination.display()))]
-    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64> {
+    async fn fetch_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        destination: &Path,
+        _options: P2pFetchOptions,
+    ) -> Result<u64> {
         if Self::prefers_primary(descriptor) {
-            match self.primary.fetch(descriptor, destination).await {
+            match self
+                .primary
+                .fetch_with_options(descriptor, destination, P2pFetchOptions::default())
+                .await
+            {
                 Ok(size) => return Ok(size),
                 Err(err) => {
                     warn!(error = %err, "composite: urma fetch failed, falling back to iroh");
                 }
             }
         }
-        self.fallback.fetch(descriptor, destination).await
+        self.fallback
+            .fetch_with_options(descriptor, destination, P2pFetchOptions::default())
+            .await
     }
 
     #[instrument(skip(self, descriptor), fields(key = %descriptor.key))]
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+    async fn fetch_bytes_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        _options: P2pFetchOptions,
+    ) -> Result<Bytes> {
         if Self::prefers_primary(descriptor) {
-            match self.primary.fetch_bytes(descriptor).await {
+            match self
+                .primary
+                .fetch_bytes_with_options(descriptor, P2pFetchOptions::default())
+                .await
+            {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => {
                     warn!(error = %err, "composite: urma fetch_bytes failed, falling back to iroh");
                 }
             }
         }
-        self.fallback.fetch_bytes(descriptor).await
+        self.fallback
+            .fetch_bytes_with_options(descriptor, P2pFetchOptions::default())
+            .await
     }
 
     #[instrument(skip(self, descriptor), fields(key = %descriptor.key, offset, len))]

@@ -2714,6 +2714,7 @@ mod tests {
             "https://registry.example/v2/data/blobs"
         );
         assert!(config.lowers.iter().all(|layer| layer.file.is_empty()));
+    }
 
     /// Build a snapshot record that exercises every managed-layer-bearing
     /// field: rootfs layers, memory layers, and an attached Overlaybd drive

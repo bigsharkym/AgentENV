@@ -168,10 +168,11 @@ impl super::transport::P2pTransport for InstrumentedP2pTransport {
             .await
     }
 
-    async fn fetch(
+    async fn fetch_with_options(
         &self,
         descriptor: &super::types::P2pArtifactDescriptor,
         destination: &std::path::Path,
+        _options: super::types::P2pFetchOptions,
     ) -> super::error::Result<u64> {
         let result = self.time(OP_FETCH, self.inner.fetch(descriptor, destination)).await;
         if let Ok(size) = result.as_ref() {
@@ -180,9 +181,10 @@ impl super::transport::P2pTransport for InstrumentedP2pTransport {
         result
     }
 
-    async fn fetch_bytes(
+    async fn fetch_bytes_with_options(
         &self,
         descriptor: &super::types::P2pArtifactDescriptor,
+        _options: super::types::P2pFetchOptions,
     ) -> super::error::Result<bytes::Bytes> {
         let result = self.time(OP_FETCH_BYTES, self.inner.fetch_bytes(descriptor)).await;
         if let Ok(bytes) = result.as_ref() {

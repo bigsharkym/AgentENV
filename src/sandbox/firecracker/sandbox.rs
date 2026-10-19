@@ -280,7 +280,8 @@ impl PausedSandboxState for FirecrackerPausedState {
             .rootfs_virtual_size
             .context("paused state missing rootfs_virtual_size")?;
 
-        let manifest = FirecrackerSnapshotManifest::new(
+        let manifest = SandboxSnapshotManifest::new(
+            crate::sandbox::manifest::FIRECRACKER_BACKEND,
             cfg.vm_state_path.clone(),
             cfg.mem_overlaybd_config.image_config_path.clone(),
             cfg.mem_virtual_size,
@@ -293,9 +294,7 @@ impl PausedSandboxState for FirecrackerPausedState {
         // The paused-state artifacts are owned by the persister; use a dummy
         // guard whose Drop is a no-op (remove_dir_all("") -> NotFound).
         let dummy_guard = Arc::new(PersistentSnapshotRootGuard::new(PathBuf::new()));
-        Ok(CapturedSandboxSnapshot::new(
-            FirecrackerCapturedSnapshot::new(manifest, dummy_guard),
-        ))
+        Ok(CapturedSandboxSnapshot::new(manifest, dummy_guard))
     }
 }
 
@@ -572,9 +571,7 @@ impl SandboxBackend for FirecrackerSandbox {
         };
 
         // Do NOT resume: the source was paused and must stay paused.
-        Ok(CapturedSandboxSnapshot::new(
-            FirecrackerCapturedSnapshot::new(manifest, live_snapshot_root),
-        ))
+        Ok(CapturedSandboxSnapshot::new(manifest, live_snapshot_root))
     }
 
     async fn fork(
