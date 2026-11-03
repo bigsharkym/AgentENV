@@ -25,6 +25,11 @@ type migrateRequest struct {
 	TargetNodeID string `json:"targetNodeID"`
 	// optional, falls back to scheduler GetNode when empty
 	TargetNodeEndpoint string `json:"targetNodeEndpoint,omitempty"`
+	// optional, selects snapshot backend ("default" or "shared_fs").
+	// When empty the runtime defaults to OSS. Forwarded to both the
+	// source snapshot publish and the target sandbox create so both
+	// ends of the migration use the same store.
+	SnapshotStore string `json:"snapshotStore,omitempty"`
 }
 
 // migrateResponse is returned on a successful migration.
@@ -182,8 +187,13 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	var snapshot struct {
 		SnapshotID string `json:"snapshotID"`
 	}
+	snapBody := map[string]interface{}{}
+	if store := strings.TrimSpace(req.SnapshotStore); store != "" {
+		snapBody["snapshotStore"] = store
+	}
+	snapBodyJSON, _ := json.Marshal(snapBody)
 	if err := s.migrateCall(migrateCtx, sourceNode.GetEndpoint(), http.MethodPost,
-		"/sandboxes/"+sandboxID+"/snapshots", nil, &snapshot); err != nil {
+		"/sandboxes/"+sandboxID+"/snapshots", bytes.NewReader(snapBodyJSON), &snapshot); err != nil {
 		s.logger.Warn("migrate: snapshot on source failed",
 			zap.String("sandbox_id", sandboxID),
 			zap.String("source_node", sourceNode.GetNodeId()),
@@ -231,12 +241,16 @@ func (s *Server) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	//    When migrating from a paused source, `startPaused=true` tells the
 	//    runtime to launch the target directly into the Paused state so the
 	//    sandbox's run state is preserved across the migration.
-	createBody, _ := json.Marshal(map[string]interface{}{
-		"templateID":   snapshot.SnapshotID,
-		"sandboxID":    sandboxID,
-		"timeout":      remainingSecs,
-		"startPaused":  sourcePaused,
-	})
+	createMap := map[string]interface{}{
+		"templateID":  snapshot.SnapshotID,
+		"sandboxID":   sandboxID,
+		"timeout":     remainingSecs,
+		"startPaused": sourcePaused,
+	}
+	if store := strings.TrimSpace(req.SnapshotStore); store != "" {
+		createMap["snapshotStore"] = store
+	}
+	createBody, _ := json.Marshal(createMap)
 	var created struct {
 		SandboxID string `json:"sandboxID"`
 	}
