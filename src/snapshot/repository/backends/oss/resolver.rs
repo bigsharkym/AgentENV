@@ -114,6 +114,10 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
         let vm_state_client = Arc::clone(&self.client);
         let p2p_transport = self.p2p_transport.clone();
         let vm_state_p2p_key = p2p::fixed_artifact_key(&id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
+        let _p_vmstate = crate::observability::stage_probe::StageProbe::start(
+            "oss.resolve.vm_state_cache",
+            "oss",
+        );
         let vm_state_handle = self
             .cache
             .ensure_cached(&vm_state_key, |dest| {
@@ -143,17 +147,27 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
             })?;
         let vm_state_path = vm_state_handle.path().to_path_buf();
         handles.push(vm_state_handle);
+        drop(_p_vmstate);
 
         // ── firecracker manifest ───────────────────────────────────
-        let committed_manifest = self
-            .load_committed_firecracker_manifest(&layout, &id)
-            .await?;
+        let committed_manifest = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "oss.resolve.read_manifest",
+                "oss",
+            );
+            self.load_committed_firecracker_manifest(&layout, &id)
+                .await?
+        };
 
         // ── memory image config ────────────────────────────────────
         let memory_layers: Vec<OverlaybdLayerRef> = committed.memory_layers.clone();
         let mem_cache_key = runtime_image_cache_key(&id, "memory/image.json");
-        let mem_image_config_path = self
-            .materialize_layers_and_pin(
+        let mem_image_config_path = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "oss.resolve.materialize_memory",
+                format!("oss layers={}", memory_layers.len()),
+            );
+            self.materialize_layers_and_pin(
                 &memory_layers,
                 &self.image_materializer.memory_image_config_path(&id),
                 MaterializeSpec {
@@ -164,12 +178,17 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                 },
                 &mut handles,
             )
-            .await?;
+            .await?
+        };
 
         // ── rootfs image config ────────────────────────────────────
         let rootfs_cache_key = runtime_image_cache_key(&id, "rootfs/image.json");
-        let rootfs_image_config_path = self
-            .materialize_layers_and_pin(
+        let rootfs_image_config_path = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "oss.resolve.materialize_rootfs",
+                format!("oss layers={}", committed.rootfs_layers.len()),
+            );
+            self.materialize_layers_and_pin(
                 &committed.rootfs_layers,
                 &self.image_materializer.rootfs_image_config_path(&id),
                 MaterializeSpec {
@@ -180,12 +199,18 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                 },
                 &mut handles,
             )
-            .await?;
+            .await?
+        };
 
         // ── attached drives ────────────────────────────────────────
-        let attached_drives = self
-            .resolve_attached_drives(&id, &committed.attached_drives, &mut handles)
-            .await?;
+        let attached_drives = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "oss.resolve.attached_drives",
+                "oss",
+            );
+            self.resolve_attached_drives(&id, &committed.attached_drives, &mut handles)
+                .await?
+        };
 
         // Runtime artifacts are protected by the sandbox start-window lease (over
         // local-only commits) + the orchestrator running set; the resolved-handle
@@ -270,12 +295,22 @@ impl OssRuntimeResolver {
             })
             .collect::<Vec<_>>();
         let client = Arc::clone(&self.client);
-        validate_managed_layers(&managed_layers, label, move |key| {
-            let client = Arc::clone(&client);
-            async move { client.exists(&key).await }
-        })
-        .await?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "oss.materialize.validate_heads",
+                format!("oss label={label} layers={}", managed_layers.len()),
+            );
+            validate_managed_layers(&managed_layers, label, move |key| {
+                let client = Arc::clone(&client);
+                async move { client.exists(&key).await }
+            })
+            .await?;
+        }
 
+        let _p = crate::observability::stage_probe::StageProbe::start(
+            "oss.materialize.write_config",
+            format!("oss label={label}"),
+        );
         self.image_materializer
             .materialize_image_config(
                 layers,

@@ -3530,7 +3530,14 @@ where
 
     let result = api_impl
         .as_ref()
-        .snapshots_snapshot_id_delete(&method, &host, &cookies, &claims, &path_params, snapshot_store)
+        .snapshots_snapshot_id_delete(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &path_params,
+            snapshot_store,
+        )
         .await;
 
     let mut response = Response::builder();

@@ -8,7 +8,7 @@ use storage_util::{CompactBuffer, CompactWriter};
 use tokio::sync::Mutex;
 
 use crate::backend::local::LocalFile;
-use crate::io::virtual_file::VirtualFile;
+use crate::io::virtual_file::{VirtualFile, VirtualFileWriter};
 use crate::layer::layer_metadata::read_overlaybd_layer_is_sparse_rw;
 use crate::lsmt::file::{CommitArgs, LSMTReadOnlyFile};
 
@@ -113,6 +113,62 @@ impl CompactWriter for DigestCompactWriter {
     }
 }
 
+/// [`CompactWriter`] that writes through to an inner writer while hashing the
+/// exact byte stream in offset order.
+///
+/// Used by dense export so the published digest is computed from the bytes as
+/// they are written, instead of re-reading the finished file.
+struct HashingFileWriter {
+    inner: Arc<dyn CompactWriter>,
+    state: Mutex<DenseLayerDigest>,
+}
+
+impl HashingFileWriter {
+    fn new(inner: Arc<dyn CompactWriter>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            state: Mutex::new(DenseLayerDigest::default()),
+        })
+    }
+
+    async fn finish(&self) -> DenseLayerDescriptor {
+        self.state.lock().await.descriptor()
+    }
+}
+
+#[async_trait]
+impl CompactWriter for HashingFileWriter {
+    async fn alloc_buffer(&self) -> Result<Box<dyn CompactBuffer>> {
+        self.inner.alloc_buffer().await
+    }
+
+    fn buffer_size(&self) -> usize {
+        self.inner.buffer_size()
+    }
+
+    /// Dense export must hash one strictly increasing byte stream, so the
+    /// writer is always sequential even if the caller raises `concurrency`.
+    fn requires_ordered_writes(&self) -> bool {
+        true
+    }
+
+    async fn write(&self, buf: Box<dyn CompactBuffer>, offset: u64, len: usize) -> Result<()> {
+        {
+            let data = AsRef::<[u8]>::as_ref(buf.as_ref());
+            if len > data.len() {
+                anyhow::bail!("dense overlaybd hashing write len exceeds buffer range");
+            }
+            self.state.lock().await.absorb(offset, &data[..len])?;
+        }
+        self.inner.write(buf, offset, len).await
+    }
+
+    async fn write_all_at(&self, data: &[u8], offset: u64) -> Result<()> {
+        self.state.lock().await.absorb(offset, data)?;
+        self.inner.write_all_at(data, offset).await
+    }
+}
+
 pub fn should_dense_export_layer(path: &Path) -> bool {
     match read_overlaybd_layer_is_sparse_rw(path) {
         Ok(is_sparse) => is_sparse,
@@ -130,6 +186,28 @@ pub fn should_dense_export_layer(path: &Path) -> bool {
 pub async fn describe_dense_layer(path: &Path) -> Result<DenseLayerDescriptor> {
     let writer = DigestCompactWriter::new(DENSE_EXPORT_BUFFER_SIZE);
     write_dense_layer_to(path, writer.clone()).await?;
+    Ok(writer.finish().await)
+}
+
+/// Dense-exports `source` to `destination` and returns the descriptor of the
+/// bytes written, hashing them in the same pass (no re-read).
+pub async fn write_dense_layer_to_file_with_digest(
+    source: &Path,
+    destination: &Path,
+) -> Result<DenseLayerDescriptor> {
+    let file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(destination).with_context(|| {
+            format!(
+                "create dense overlaybd layer destination '{}'",
+                destination.display()
+            )
+        })?);
+    let inner: Arc<dyn CompactWriter> = Arc::new(VirtualFileWriter::new(file.clone()));
+    let writer = HashingFileWriter::new(inner);
+    write_dense_layer_to(source, writer.clone()).await?;
+    file.sync()
+        .await
+        .with_context(|| format!("sync dense overlaybd layer '{}'", destination.display()))?;
     Ok(writer.finish().await)
 }
 
@@ -220,5 +298,42 @@ mod tests {
             .unwrap()
             .iter()
             .all(|b| *b == 0));
+    }
+
+    #[tokio::test]
+    async fn streaming_digest_matches_re_read_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let sparse_path = temp.path().join("snapshot.commit");
+        let dense_a = temp.path().join("dense-a.commit");
+        let dense_b = temp.path().join("dense-b.commit");
+        let virtual_size = 64 * 1024 * 1024;
+
+        let sparse_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&sparse_path).unwrap());
+        let sparse = LSMTFile::create(sparse_file, None, virtual_size, true)
+            .await
+            .unwrap();
+        sparse.write_at(0, &vec![0xAB; 4096]).await.unwrap();
+        sparse
+            .write_at(32 * 1024 * 1024, &vec![0xCD; 4096])
+            .await
+            .unwrap();
+        sparse.close_seal().await.unwrap();
+        drop(sparse);
+
+        // Path under test: streaming digest.
+        let streamed = write_dense_layer_to_file_with_digest(&sparse_path, &dense_a)
+            .await
+            .unwrap();
+
+        // Reference: write without digest, then re-read.
+        let dense_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&dense_b).unwrap());
+        write_dense_layer_to(&sparse_path, CommitArgs::new(dense_file.clone()).writer)
+            .await
+            .unwrap();
+        let reread = describe_dense_layer(&dense_b).await.unwrap();
+
+        assert_eq!(streamed.digest, reread.digest);
+        assert_eq!(streamed.size, reread.size);
+        assert_eq!(streamed.size, dense_file.size().await.unwrap());
     }
 }

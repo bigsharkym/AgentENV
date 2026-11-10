@@ -672,12 +672,18 @@ impl FirecrackerSandbox {
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
-        envd_instance
-            .wait_for_ready(
-                self.runtime_policy.envd_timeout,
-                self.runtime_policy.envd_poll_interval,
-            )
-            .await?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "ready.envd_wait",
+                "wait_for_ready",
+            );
+            envd_instance
+                .wait_for_ready(
+                    self.runtime_policy.envd_timeout,
+                    self.runtime_policy.envd_poll_interval,
+                )
+                .await?;
+        }
         if let Some(device_key) = &self.mem_snapshot_image_config_path {
             // envd is up: release held background downloads for this memory
             // device. Best-effort — downloads would also start after the
@@ -692,6 +698,10 @@ impl FirecrackerSandbox {
                 .notify_sandbox_ready(device_key)
                 .await;
         }
+        let _p = crate::observability::stage_probe::StageProbe::start(
+            "ready.envd_init",
+            "wait_for_ready",
+        );
         envd_instance
             .init(
                 self.launch.common().env_vars.clone(),
@@ -1503,26 +1513,38 @@ impl FirecrackerSandbox {
         );
 
         // ── Tools drive: symlink rootfs.ext4 → tools drive (read-only, from snapshot config) ──
-        self.link_tools_drive(&config.common, fc_cwd)?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.link_tools_drive",
+                "start_resume",
+            );
+            self.link_tools_drive(&config.common, fc_cwd)?;
+        }
 
         // ── User image: restore overlaybd via ublk ──
         if config.common.ublk_config.is_some() {
             let user_image_symlink = fc_cwd.join(USER_ROOTFS_DRIVE_PATH);
             let global_cfg_path = global_config.ublk.overlaybd.global_config_path.clone();
             let runtime_dir = fc_cwd.join("overlaybd");
-            let runtime_device = UblkDeviceManager::global()
-                .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                    source_image_config: &rootfs_image_config.image_config_path,
-                    global_config: &global_cfg_path,
-                    runtime_dir: &runtime_dir,
-                    read_only: rootfs_image_config.read_only,
-                    runtime_upper_mode: rootfs_image_config.runtime_upper_mode,
-                    requested_virtual_size: Some(rootfs_virtual_size),
-                    known_source_virtual_size: Some(rootfs_virtual_size),
-                    allow_shrink: false,
-                })
-                .await
-                .context("create user image overlaybd runtime device for resume")?;
+            let runtime_device = {
+                let _p = crate::observability::stage_probe::StageProbe::start(
+                    "resume.overlaybd_runtime_device",
+                    format!("config={}", rootfs_image_config.image_config_path.display()),
+                );
+                UblkDeviceManager::global()
+                    .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
+                        source_image_config: &rootfs_image_config.image_config_path,
+                        global_config: &global_cfg_path,
+                        runtime_dir: &runtime_dir,
+                        read_only: rootfs_image_config.read_only,
+                        runtime_upper_mode: rootfs_image_config.runtime_upper_mode,
+                        requested_virtual_size: Some(rootfs_virtual_size),
+                        known_source_virtual_size: Some(rootfs_virtual_size),
+                        allow_shrink: false,
+                    })
+                    .await
+                    .context("create user image overlaybd runtime device for resume")?
+            };
             self.rootfs_image_config_path = Some(rootfs_image_config.image_config_path.clone());
             let device_path = runtime_device.device.device_path().to_path_buf();
             let symlink_result = std::os::unix::fs::symlink(&device_path, &user_image_symlink)
@@ -1548,15 +1570,25 @@ impl FirecrackerSandbox {
         }
 
         // ── Extra drives ──
-        self.prepare_snapshot_backing_drives(&config.common.extra_drives)
-            .await
-            .context("prepare snapshot-backed extra drives for resume")?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.extra_drives",
+                "start_resume",
+            );
+            self.prepare_snapshot_backing_drives(&config.common.extra_drives)
+                .await
+                .context("prepare snapshot-backed extra drives for resume")?;
+        }
 
         // ── Network + Firecracker spawn ──
         let needs_socket_wait = self.network_slot.is_none();
         let interaction_ip = if let Some(slot) = self.network_slot.as_ref() {
             slot.host_interaction_ip
         } else {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.network_spawn",
+                "start_resume",
+            );
             let slot = NetworkManager::global()
                 .allocate_any()
                 .context("Failed to allocate network slot for resume")?;
@@ -1581,6 +1613,10 @@ impl FirecrackerSandbox {
             interaction_ip
         };
         if let Some(slot) = self.network_slot.as_mut() {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.egress_policy",
+                "start_resume",
+            );
             slot.set_egress_policy(config.common.network_policy.as_ref())
                 .context("Failed to configure sandbox egress policy for resume")?;
         }
@@ -1615,22 +1651,35 @@ impl FirecrackerSandbox {
             .memory_snapshot
             .overlaybd_global_config_path
             .clone();
-        let mem_device = UblkDeviceManager::global()
-            .get_or_create_shared_mem(
-                &UblkCreateSpec::Overlaybd {
-                    image_config: config.mem_overlaybd_config.image_config_path.clone(),
-                    global_config: mem_global_config,
-                },
-                config.mem_virtual_size,
-            )
-            .await
-            .context("create or reuse shared memory ublk device for resume")?;
+        let mem_device = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.mem_ublk_device",
+                format!(
+                    "config={}",
+                    config.mem_overlaybd_config.image_config_path.display()
+                ),
+            );
+            UblkDeviceManager::global()
+                .get_or_create_shared_mem(
+                    &UblkCreateSpec::Overlaybd {
+                        image_config: config.mem_overlaybd_config.image_config_path.clone(),
+                        global_config: mem_global_config,
+                    },
+                    config.mem_virtual_size,
+                )
+                .await
+                .context("create or reuse shared memory ublk device for resume")?
+        };
         let mem_device_path = mem_device.device_path().to_path_buf();
         self.mem_snapshot_image_config_path =
             Some(config.mem_overlaybd_config.image_config_path.clone());
         self.mem_ublk_device = Some(mem_device);
 
         if needs_socket_wait {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.fc_socket_wait",
+                "start_resume",
+            );
             self.fc_instance
                 .wait_for_ready(
                     self.runtime_policy.socket_timeout,
@@ -1639,22 +1688,40 @@ impl FirecrackerSandbox {
                 .await?;
         }
 
-        self.configure_logger(&config.common).await?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.configure_logger",
+                "start_resume",
+            );
+            self.configure_logger(&config.common).await?;
+        }
 
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
-        self.fc_instance
-            .load_snapshot_file(
-                &vm_state_src,
-                &mem_device_path,
-                &network_overrides,
-                false,
-                config.common.track_dirty_pages,
-            )
-            .await?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.load_snapshot_file",
+                format!("vm_state={}", vm_state_src.display()),
+            );
+            self.fc_instance
+                .load_snapshot_file(
+                    &vm_state_src,
+                    &mem_device_path,
+                    &network_overrides,
+                    false,
+                    config.common.track_dirty_pages,
+                )
+                .await?;
+        }
 
-        let mmds_metadata = self.mmds_metadata(&config.common);
-        self.fc_instance.set_mmds(&mmds_metadata).await?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.set_mmds",
+                "start_resume",
+            );
+            let mmds_metadata = self.mmds_metadata(&config.common);
+            self.fc_instance.set_mmds(&mmds_metadata).await?;
+        }
 
         // A restored snapshot inherits whatever limiter was active when it was
         // paused, so reconcile against the node's current config while the VM is
@@ -1662,13 +1729,25 @@ impl FirecrackerSandbox {
         // Both buckets are always overwritten (configured or unlimited) so an
         // inherited dimension the current config leaves unset is cleared rather
         // than left unchanged.
-        let reconciled = reconcile_disk_rate_limiter(&config.common.disk_rate_limit)?;
-        self.fc_instance
-            .patch_drive_rate_limiter(USER_ROOTFS_DRIVE_ID, reconciled)
-            .await
-            .context("reconcile disk rate limiter on snapshot resume")?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.patch_rate_limiter",
+                "start_resume",
+            );
+            let reconciled = reconcile_disk_rate_limiter(&config.common.disk_rate_limit)?;
+            self.fc_instance
+                .patch_drive_rate_limiter(USER_ROOTFS_DRIVE_ID, reconciled)
+                .await
+                .context("reconcile disk rate limiter on snapshot resume")?;
+        }
 
-        self.fc_instance.resume().await?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resume.fc_resume",
+                "start_resume",
+            );
+            self.fc_instance.resume().await?;
+        }
 
         debug!("sandbox restored from snapshot config");
         Ok(())

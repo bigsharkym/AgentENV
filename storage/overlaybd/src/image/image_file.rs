@@ -27,7 +27,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 const DEFAULT_BLOCK_SIZE: u32 = 512;
-const IO_ENGINE_LIBAIO: u32 = 2;
+pub(crate) const IO_ENGINE_LIBAIO: u32 = 2;
 
 struct OpenedLowerLayer {
     file: Arc<dyn VirtualFile>,
@@ -558,7 +558,15 @@ impl ImageFile {
     ) -> Result<OpenedLowerLayer> {
         let local_path = Self::open_localfile_path(&layer).await?;
         let mut opened = if let Some(local_path) = local_path {
-            match Self::open_ro_file(&local_path, image_service).await {
+            // Only an explicit `file=` can name a network filesystem mounted at
+            // a local path (shared_fs). `dir=` always resolves to the node-local
+            // commit cache, which is genuine local disk and needs no extra layer.
+            let opened_file = if layer.file.is_empty() {
+                Self::open_ro_file(&local_path, image_service).await
+            } else {
+                Self::open_ro_file_cached(&local_path, image_service, &layer).await
+            };
+            match opened_file {
                 Ok(file) => OpenedLowerLayer {
                     file,
                     download: None,
@@ -644,7 +652,6 @@ impl ImageFile {
         path: &Path,
         image_service: &ImageService,
     ) -> Result<Arc<dyn VirtualFile>> {
-        let path_display = path.to_string_lossy().into_owned();
         let direct_io = image_service.io_engine() == IO_ENGINE_LIBAIO;
         let file: Arc<dyn VirtualFile> = Arc::new(
             LocalFile::builder()
@@ -653,6 +660,37 @@ impl ImageFile {
                 .direct_io(direct_io)
                 .open(path)?,
         );
+        Self::wrap_tar_and_switch(file, path).await
+    }
+
+    /// Open a local read-only layer through the userspace block cache.
+    ///
+    /// The raw [`LocalFile`] is wrapped in a [`CachedFile`] *before* the tar /
+    /// switch adaptors so that the cache sits directly on top of the backing
+    /// filesystem and sees the real block reads.
+    async fn open_ro_file_cached(
+        path: &Path,
+        image_service: &ImageService,
+        layer: &LayerConfig,
+    ) -> Result<Arc<dyn VirtualFile>> {
+        // Prefer the content digest so identical layers share one cache entry
+        // across snapshots; fall back to the path when no digest is present.
+        let cache_key = if layer.digest.is_empty() {
+            format!("sharedfs:{}", path.display())
+        } else {
+            format!("sharedfs:{}", layer.digest)
+        };
+        let cached = image_service
+            .open_local_blob_cached(&cache_key, path, (layer.size != 0).then_some(layer.size))
+            .await?;
+        Self::wrap_tar_and_switch(cached, path).await
+    }
+
+    async fn wrap_tar_and_switch(
+        file: Arc<dyn VirtualFile>,
+        path: &Path,
+    ) -> Result<Arc<dyn VirtualFile>> {
+        let path_display = path.to_string_lossy().into_owned();
         let tar_file = new_tar_file_adaptor(file).await?;
         let switch = new_switch_file(tar_file, true, Some(path_display.as_str())).await?;
         Ok(switch)
@@ -3091,5 +3129,58 @@ mod tests {
 
         let got = image.read_at(512, 1024).await.expect("direct-io read");
         assert_eq!(got.as_ref(), &payload[512..1536]);
+    }
+
+    /// A layer addressed by an explicit `file=` is routed through the userspace
+    /// block cache, so a cache entry must exist after the image is opened and
+    /// read. This is what gives network filesystems mounted at a local path
+    /// (shared_fs / xmfs) the same block-sized read-ahead as remote layers.
+    #[tokio::test]
+    async fn test_local_file_lower_is_routed_through_block_cache() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        let payload: Vec<u8> = (0..8192).map(|v| (v % 251) as u8).collect();
+        create_sealed_lower(&lower_path, &lower_index, &payload)
+            .await
+            .expect("build sealed lower");
+
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: vec![LayerConfig {
+                file: lower_path.to_string_lossy().into_owned(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig::default(),
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let service = build_service(&tmp).await;
+        let image = ImageFile::open(image_cfg, service, None)
+            .await
+            .expect("open image with cached local lower");
+
+        // Reading forces a refill through the cache.
+        let got = image.read_at(0, payload.len()).await.expect("cached read");
+        assert_eq!(got.as_ref(), &payload[..]);
+
+        // The cache directory must now hold an entry for this layer.
+        let cache_dir = tmp.path().join("cache");
+        let mut entries = 0usize;
+        if let Ok(rd) = std::fs::read_dir(&cache_dir) {
+            for entry in rd.flatten() {
+                if entry.path().is_dir() {
+                    entries += 1;
+                }
+            }
+        }
+        assert!(
+            entries > 0,
+            "expected a block-cache entry under {}, found none",
+            cache_dir.display()
+        );
     }
 }

@@ -15,8 +15,7 @@ use crate::snapshot::repository::backends::{build_shared_fs_backend, build_snaps
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
 use crate::snapshot::{
-    OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
-    SnapshotRecord,
+    OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
@@ -387,9 +386,20 @@ impl SnapshotManager {
         store: SnapshotStore,
         id_or_alias: impl AsRef<str>,
     ) -> anyhow::Result<Option<RunnableSnapshot>> {
-        let Some(snapshot) = self.get_from(store, id_or_alias.as_ref()).await? else {
+        let probe_ctx = format!("store={:?}", store);
+        let Some(snapshot) = ({
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "resolve.get_record",
+                probe_ctx.clone(),
+            );
+            self.get_from(store, id_or_alias.as_ref()).await?
+        }) else {
             return Ok(None);
         };
+        let _p = crate::observability::stage_probe::StageProbe::start(
+            "resolve.resolve_runnable",
+            probe_ctx,
+        );
         self.resolve_runnable_from(store, snapshot).await.map(Some)
     }
 

@@ -2149,31 +2149,50 @@ where
         // Build and start the sandbox first, before making any state changes, so that we don't
         // have to roll back any persisted state if the build fails.
         // Meanwhile, the start process can be overlapped with the initial state persistence.
-        let mut sandbox = match self.build_sandbox(&plan) {
-            Ok(sandbox) => sandbox,
-            Err(err) => {
-                self.rollback_failed_launch_metadata(&plan, transitional_state)
-                    .await;
-                return Err(err);
+        let probe_ctx = format!("sandbox={sandbox_id}");
+        let mut sandbox = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "launch.build_sandbox",
+                probe_ctx.clone(),
+            );
+            match self.build_sandbox(&plan) {
+                Ok(sandbox) => sandbox,
+                Err(err) => {
+                    self.rollback_failed_launch_metadata(&plan, transitional_state)
+                        .await;
+                    return Err(err);
+                }
             }
         };
 
         // Protect artifacts before the backend opens them.
         let startup_artifacts = sandbox.startup_artifacts();
-        if let Err(err) = self
-            .protect_image_refs(
+        let protect_result = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "launch.protect_image_refs",
+                probe_ctx.clone(),
+            );
+            self.protect_image_refs(
                 RuntimeImageOwner::StartingSandbox(sandbox_id),
                 startup_artifacts,
                 "starting sandbox",
             )
             .await
-        {
+        };
+        if let Err(err) = protect_result {
             warn!(error = %format_args!("{err:#}"), "failed to protect starting runtime artifacts");
             self.rollback_failed_launch_metadata(&plan, transitional_state)
                 .await;
             return Err(err);
         }
-        if let Err(source) = sandbox.start_nowait().await {
+        let start_result = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "launch.start_nowait",
+                probe_ctx.clone(),
+            );
+            sandbox.start_nowait().await
+        };
+        if let Err(source) = start_result {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
             if let Err(stop_err) = sandbox.stop().await {
                 warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after start failure");
@@ -2219,7 +2238,14 @@ where
 
         // Persist the sandbox metadata if needed (during creation).
         if let Some(metadata) = transitional_metadata.as_ref() {
-            if let Err(err) = self.store.add(metadata.clone()).await {
+            let persist_result = {
+                let _p = crate::observability::stage_probe::StageProbe::start(
+                    "launch.persist_metadata",
+                    probe_ctx.clone(),
+                );
+                self.store.add(metadata.clone()).await
+            };
+            if let Err(err) = persist_result {
                 warn!(error = %format_args!("{err:#}"), "failed to persist sandbox metadata; cleaning up");
                 self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::Registered)
                     .await;
@@ -2237,6 +2263,10 @@ where
 
         // Wait for the sandbox to be ready
         let wait_result = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "launch.wait_for_ready",
+                probe_ctx.clone(),
+            );
             let sandbox = handle.lock().await;
             sandbox.wait_for_ready().await
         };

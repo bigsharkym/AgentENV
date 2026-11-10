@@ -660,11 +660,15 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
         let snapshot = match timer
-            .time(
-                "load_snapshot",
+            .time("load_snapshot", async {
+                let _p = crate::observability::stage_probe::StageProbe::start(
+                    "api.load_runnable_from",
+                    format!("store={store:?} template={}", body.template_id),
+                );
                 self.snapshot_manager
-                    .load_runnable_from(store, &body.template_id),
-            )
+                    .load_runnable_from(store, &body.template_id)
+                    .await
+            })
             .await
         {
             Ok(Some(snapshot)) => snapshot,
@@ -745,10 +749,14 @@ impl Sandboxes<()> for ApiImpl {
             start_paused,
         };
 
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
+        let create_fut = async {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "api.orchestrator_create",
+                format!("store={store:?}"),
+            );
+            self.orchestrator.create_sandbox(request).await
+        };
+        match timer.time("create_sandbox", create_fut).await {
             Ok(metadata) => {
                 let sandbox_id = metadata.id.to_string();
                 Ok(

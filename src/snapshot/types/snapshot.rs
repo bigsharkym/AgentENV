@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use std::sync::OnceLock;
 
-use serde::{Deserialize, Serialize};
 use serde::de::{self, Deserializer};
+use serde::{Deserialize, Serialize};
 
 use crate::sandbox::CustomExtensionParams;
 use crate::virtualization::VirtualizationMode;
@@ -309,15 +309,13 @@ where
             let mut out = Vec::new();
             while let Some(value) = seq.next_element::<serde_json::Value>()? {
                 // Try new tagged format first.
-                if let Ok(layer) =
-                    serde_json::from_value::<OverlaybdLayerRef>(value.clone())
-                {
+                if let Ok(layer) = serde_json::from_value::<OverlaybdLayerRef>(value.clone()) {
                     out.push(layer);
                     continue;
                 }
                 // Fall back to legacy plain ManagedLayer.
-                let managed = serde_json::from_value::<ManagedLayer>(value)
-                    .map_err(de::Error::custom)?;
+                let managed =
+                    serde_json::from_value::<ManagedLayer>(value).map_err(de::Error::custom)?;
                 out.push(OverlaybdLayerRef::Managed(managed));
             }
             Ok(out)

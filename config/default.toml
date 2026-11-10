@@ -113,7 +113,7 @@ low_watermark_ratio = 0.70
 # production unless the deployment accepts that operational risk.
 [p2p]
 # Master switch for peer-to-peer artifact transport.
-enabled = true
+enabled = false
 # Transport implementation: "iroh" or "disabled".
 transport = "iroh"
 # Local content store for the transport.
@@ -219,7 +219,7 @@ root = "/mnt/aenv-snapshots"
 # EXPERIMENTAL: publish snapshot artifacts to P2P and use P2P during OSS
 # resolution. Effective only when [p2p].enabled is also true. POSIX fixed
 # artifacts remain authoritative in their repository.
-p2p_enabled = true
+p2p_enabled = false
 
 # OSS only: publish a compatible rootfs back to its source registry as
 # agentenv-snapshot-{snapshot_id}. Existing remote layers are reused by digest;

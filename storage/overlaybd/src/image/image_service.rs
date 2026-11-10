@@ -14,7 +14,7 @@ use crate::config::{
     load_global_config, resolve_image_config_local_paths, validate_image_config, DownloadConfig,
     GlobalConfig, ImageConfig,
 };
-use crate::image::image_file::ImageFile;
+use crate::image::image_file::{ImageFile, IO_ENGINE_LIBAIO};
 use crate::io::virtual_file::VirtualFile;
 use crate::lsmt::file::CommitArgs;
 use anyhow::{bail, Context, Result};
@@ -418,6 +418,48 @@ impl ImageService {
                 None => Err(error).context("submit background downloads"),
             },
         }
+    }
+
+    /// Open a **local** file through the userspace block cache.
+    ///
+    /// Local files normally bypass the cache on the assumption that the local
+    /// filesystem is fast. That assumption breaks for a network filesystem
+    /// mounted at a local path (e.g. xmfs at `/mnt/aenv-snapshots`), where every
+    /// small read pays a large fixed cost and the kernel page cache is largely
+    /// ineffective. Routing such layers through [`CachedFile`] gives them the
+    /// same block-sized read-ahead that remote layers already get.
+    ///
+    /// Returns a plain [`LocalFile`] when no cache backend is configured, so the
+    /// behaviour is unchanged in that case.
+    pub(crate) async fn open_local_blob_cached(
+        &self,
+        cache_key: &str,
+        path: &Path,
+        source_size: Option<u64>,
+    ) -> Result<Arc<dyn VirtualFile>> {
+        let direct_io = self.io_engine() == IO_ENGINE_LIBAIO;
+        let source: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::builder()
+                .write(false)
+                .create(false)
+                .direct_io(direct_io)
+                .open(path)?,
+        );
+
+        let remote_runtime = self.remote_runtime().await?;
+        let Some(cache) = remote_runtime.file_cache.as_ref() else {
+            return Ok(source);
+        };
+
+        let source_size = match source_size {
+            Some(size) if size > 0 => size,
+            _ => source.size().await?,
+        };
+        let cached = cache
+            .open_file_with_source_size(cache_key.to_string(), source, source_size)
+            .await?;
+        let cached: Arc<dyn VirtualFile> = cached;
+        Ok(cached)
     }
 
     async fn open_cached_blob(

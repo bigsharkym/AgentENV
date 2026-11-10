@@ -178,9 +178,20 @@ impl PosixFsCatalogStore {
     }
 
     pub(crate) fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.ensure_layout()?;
+        // The read path must not create directories: `ensure_layout()` costs four
+        // network round-trips per directory on a remote filesystem (xmfs), while a
+        // missing parent simply makes `load_record_by_id_unlocked` return `None`.
+        // The write path (`begin_publish` / `create`) and `list()` still ensure the
+        // layout themselves.
         if let Ok(direct_id) = SnapshotId::parse(id_or_alias) {
-            if let Some(record) = self.load_record_by_id_unlocked(&direct_id)? {
+            let loaded = {
+                let _p = crate::observability::stage_probe::StageProbe::start(
+                    "catalog.get.load_record",
+                    format!("root={}", self.root.display()),
+                );
+                self.load_record_by_id_unlocked(&direct_id)?
+            };
+            if let Some(record) = loaded {
                 return Ok(Some(record));
             }
         }
@@ -400,62 +411,21 @@ impl PosixFsCatalogStore {
         let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
             RepositoryError::backend(format!("serialize json '{}'", path.display()), error)
         })?;
-        let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
-            message: format!("resolve parent for '{}'", path.display()),
-            source: None,
-        })?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
-            RepositoryError::backend(format!("create temp file in '{}'", parent.display()), error)
-        })?;
-        temp.write_all(&bytes).map_err(|error| {
-            RepositoryError::backend(
-                format!("write temp json '{}'", temp.path().display()),
-                error,
-            )
-        })?;
-        temp.as_file().sync_all().map_err(|error| {
-            RepositoryError::backend(format!("sync temp json '{}'", temp.path().display()), error)
-        })?;
-        let tmp_path = temp.path().to_path_buf();
-        temp.persist(path).map_err(|error| {
-            RepositoryError::backend(
-                format!(
-                    "persist json '{}' -> '{}'",
-                    tmp_path.display(),
-                    path.display()
-                ),
-                error.error,
-            )
+        fs::write(path, &bytes).map_err(|error| {
+            RepositoryError::backend(format!("write json '{}'", path.display()), error)
         })?;
         Ok(())
     }
 
     fn write_commit_marker(&self, id: &SnapshotId) -> RepositoryResult<()> {
         let path = self.commit_marker_path(id);
-        let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
-            message: format!("resolve parent for '{}'", path.display()),
-            source: None,
-        })?;
-        fs::create_dir_all(parent).map_err(|error| {
-            RepositoryError::backend(format!("create '{}'", parent.display()), error)
-        })?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
-            RepositoryError::backend(
-                format!("create temp commit marker in '{}'", path.display()),
-                error,
-            )
-        })?;
-        temp.write_all(b"committed").map_err(|error| {
-            RepositoryError::backend(
-                format!("write commit marker '{}'", temp.path().display()),
-                error,
-            )
-        })?;
-        temp.persist(&path).map_err(|error| {
-            RepositoryError::backend(
-                format!("persist commit marker '{}'", path.display()),
-                error.error,
-            )
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                RepositoryError::backend(format!("create '{}'", parent.display()), error)
+            })?;
+        }
+        fs::write(&path, b"committed").map_err(|error| {
+            RepositoryError::backend(format!("write commit marker '{}'", path.display()), error)
         })?;
         Ok(())
     }

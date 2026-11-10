@@ -184,8 +184,14 @@ impl Snapshots<()> for ApiImpl {
                 ));
             }
         };
-        match self.snapshot_manager.delete_from(store, &path_params.snapshot_id).await {
-            Ok(_) => Ok(SnapshotsSnapshotIdDeleteResponse::Status204_TheSnapshotWasDeletedSuccessfully),
+        match self
+            .snapshot_manager
+            .delete_from(store, &path_params.snapshot_id)
+            .await
+        {
+            Ok(_) => {
+                Ok(SnapshotsSnapshotIdDeleteResponse::Status204_TheSnapshotWasDeletedSuccessfully)
+            }
             Err(err) => Ok(SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
                 Self::snapshot_manager_error(&err),
             )),

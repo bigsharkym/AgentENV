@@ -150,3 +150,6 @@ debug = 0
 [profile.test.package.librocksdb-sys]
 opt-level = 3
 debug = 0
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = { version = "0.10", features = ["asm-aarch64"] }

@@ -657,21 +657,32 @@ impl SnapshotRuntimeResolver for SharedFsRuntimeResolver {
             .storage
             .snapshot_dir(&id)
             .join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-        if !vm_state_path.exists() {
-            return Err(RepositoryError::ArtifactNotFound {
-                artifact: format!("shared-fs vm state at '{}'", vm_state_path.display()),
-            });
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "sf.resolve.vm_state_exists",
+                "shared_fs",
+            );
+            if !vm_state_path.exists() {
+                return Err(RepositoryError::ArtifactNotFound {
+                    artifact: format!("shared-fs vm state at '{}'", vm_state_path.display()),
+                });
+            }
         }
-        let manifest_bytes = self
-            .storage
-            .read_fixed_artifact(&id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest)?;
-        let committed_manifest: FirecrackerSnapshotManifest =
+        let committed_manifest: FirecrackerSnapshotManifest = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "sf.resolve.read_manifest",
+                "shared_fs",
+            );
+            let manifest_bytes = self
+                .storage
+                .read_fixed_artifact(&id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest)?;
             serde_json::from_slice(&manifest_bytes).map_err(|error| {
                 RepositoryError::backend(
                     format!("parse firecracker manifest for snapshot '{}'", id),
                     error,
                 )
-            })?;
+            })?
+        };
 
         // Memory layers are already typed in the committed record: `SharedFS`
         // variants reference the shared filesystem by absolute path, `Managed`
@@ -737,13 +748,19 @@ impl SnapshotRuntimeResolver for SharedFsRuntimeResolver {
                 _handles: Vec::new(),
             });
 
-        let runtime_manifest = crate::snapshot::runtime_support::hydrate_runtime_manifest(
-            committed_manifest,
-            vm_state_path,
-            mem_image_config_path,
-            rootfs_image_config_path,
-            &attached_drives,
-        )?;
+        let runtime_manifest = {
+            let _p = crate::observability::stage_probe::StageProbe::start(
+                "sf.resolve.hydrate_manifest",
+                "shared_fs",
+            );
+            crate::snapshot::runtime_support::hydrate_runtime_manifest(
+                committed_manifest,
+                vm_state_path,
+                mem_image_config_path,
+                rootfs_image_config_path,
+                &attached_drives,
+            )?
+        };
         let _ = &self.inner; // inner kept for parity; resolution is self-contained
         Ok(RunnableSnapshot::new(
             (*snapshot).clone(),
@@ -761,6 +778,12 @@ fn write_image_config(
     relative_path: &str,
     layers: &[OverlaybdLayerRef],
 ) -> RepositoryResult<PathBuf> {
+    let label: &'static str = match relative_path {
+        "memory/image.json" => "sf.resolve.write_memory_image_json",
+        "rootfs/image.json" => "sf.resolve.write_rootfs_image_json",
+        _ => "sf.resolve.write_attached_image_json",
+    };
+    let _p = crate::observability::stage_probe::StageProbe::start(label, "shared_fs");
     let destination = runtime_root.join(relative_path);
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {

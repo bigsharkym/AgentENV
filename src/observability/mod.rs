@@ -16,6 +16,7 @@ mod model;
 pub mod prometheus;
 mod reporter;
 mod service;
+pub mod stage_probe;
 
 pub use host::{DiskMetric, HostMetrics, HostMetricsCollector};
 pub use model::{MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
