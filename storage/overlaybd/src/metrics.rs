@@ -8,6 +8,7 @@ pub(crate) enum RemoteSource {
     RegistryDirect { host: String },
     RegistryP2p,
     OssObject,
+    LocalFile,
 }
 
 impl RemoteSource {
@@ -16,6 +17,7 @@ impl RemoteSource {
             Self::RegistryDirect { .. } => "registry_direct",
             Self::RegistryP2p => "registry_p2p",
             Self::OssObject => "oss_object",
+            Self::LocalFile => "local_file",
         }
     }
 
@@ -25,7 +27,7 @@ impl RemoteSource {
     fn registry_label(&self) -> &str {
         match self {
             Self::RegistryDirect { host } => host,
-            Self::RegistryP2p | Self::OssObject => "none",
+            Self::RegistryP2p | Self::OssObject | Self::LocalFile => "none",
         }
     }
 }

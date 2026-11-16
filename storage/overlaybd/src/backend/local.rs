@@ -468,8 +468,25 @@ impl LocalFileInner {
         }
     }
 
-    /// Shared implementation of `read_at` parameterised on the submitter.
+    /// Instrumented wrapper: records io_uring-backed local reads.
     async fn read_at_via<S>(&self, submitter: &S, offset: u64, len: usize) -> Result<Bytes>
+    where
+        S: IoUringSubmitter + ?Sized,
+    {
+        let start = std::time::Instant::now();
+        let result = self.read_at_via_inner(submitter, offset, len).await;
+        crate::metrics::record_remote_read(
+            &crate::metrics::RemoteSource::LocalFile,
+            crate::metrics::RemoteReadOperation::ReadRange,
+            &result,
+            |body| body.len() as u64,
+            start.elapsed(),
+        );
+        result
+    }
+
+    /// Shared implementation of `read_at` parameterised on the submitter.
+    async fn read_at_via_inner<S>(&self, submitter: &S, offset: u64, len: usize) -> Result<Bytes>
     where
         S: IoUringSubmitter + ?Sized,
     {
@@ -482,8 +499,25 @@ impl LocalFileInner {
         self.read_buffered_at_via(submitter, offset, len).await
     }
 
-    /// Shared implementation of `read_at_into` parameterised on the submitter.
+    /// Instrumented wrapper: records io_uring-backed local reads.
     async fn read_at_into_via<S>(&self, submitter: &S, offset: u64, dst: &mut [u8]) -> Result<usize>
+    where
+        S: IoUringSubmitter + ?Sized,
+    {
+        let start = std::time::Instant::now();
+        let result = self.read_at_into_via_inner(submitter, offset, dst).await;
+        crate::metrics::record_remote_read(
+            &crate::metrics::RemoteSource::LocalFile,
+            crate::metrics::RemoteReadOperation::ReadRangeInto,
+            &result,
+            |n| *n as u64,
+            start.elapsed(),
+        );
+        result
+    }
+
+    /// Shared implementation of `read_at_into` parameterised on the submitter.
+    async fn read_at_into_via_inner<S>(&self, submitter: &S, offset: u64, dst: &mut [u8]) -> Result<usize>
     where
         S: IoUringSubmitter + ?Sized,
     {
@@ -578,8 +612,18 @@ impl VirtualFile for LocalFile {
         if len == 0 {
             return Ok(Bytes::new());
         }
-        self.offload("read_at", move |inner| inner.read_at_sync(offset, len))
-            .await
+        let start = std::time::Instant::now();
+        let result = self
+            .offload("read_at", move |inner| inner.read_at_sync(offset, len))
+            .await;
+        crate::metrics::record_remote_read(
+            &crate::metrics::RemoteSource::LocalFile,
+            crate::metrics::RemoteReadOperation::ReadRange,
+            &result,
+            |body| body.len() as u64,
+            start.elapsed(),
+        );
+        result
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -597,7 +641,33 @@ impl VirtualFile for LocalFile {
     /// in and get it back, like `tokio-uring` does) or `block_in_place` gated
     /// on the runtime flavor.
     async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
-        self.inner.read_at_into_sync(offset, dst)
+        let start = std::time::Instant::now();
+        let len = dst.len();
+        let inner = self.inner.clone();
+        let result = match tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; len];
+            let n = inner.read_at_into_sync(offset, &mut buf)?;
+            buf.truncate(n);
+            Ok::<Vec<u8>, anyhow::Error>(buf)
+        })
+        .await
+        {
+            Ok(Ok(buf)) => {
+                let n = buf.len();
+                dst[..n].copy_from_slice(&buf);
+                Ok(n)
+            }
+            Ok(Err(err)) => Err(err),
+            Err(err) => Err(anyhow!("LocalFile read_at_into join failed: {err}")),
+        };
+        crate::metrics::record_remote_read(
+            &crate::metrics::RemoteSource::LocalFile,
+            crate::metrics::RemoteReadOperation::ReadRangeInto,
+            &result,
+            |n| *n as u64,
+            start.elapsed(),
+        );
+        result
     }
 
     /// TODO: blocks the calling thread — see [`Self::read_at_into`] for why the
@@ -634,7 +704,36 @@ impl VirtualFile for LocalFile {
         offset: u64,
         dst: &'a mut [u8],
     ) -> LocalBoxFuture<'a, Result<usize>> {
-        Box::pin(self.inner.read_at_into_via(ctx.ring(), offset, dst))
+        Box::pin(async move {
+            let _ = ctx;
+            let start = std::time::Instant::now();
+            let len = dst.len();
+            let inner = self.inner.clone();
+            let result = match tokio::task::spawn_blocking(move || {
+                let mut buf = vec![0u8; len];
+                let n = inner.read_at_into_sync(offset, &mut buf)?;
+                buf.truncate(n);
+                Ok::<Vec<u8>, anyhow::Error>(buf)
+            })
+            .await
+            {
+                Ok(Ok(buf)) => {
+                    let n = buf.len();
+                    dst[..n].copy_from_slice(&buf);
+                    Ok(n)
+                }
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(anyhow!("LocalFile read_at_into_with_ctx join failed: {err}")),
+            };
+            crate::metrics::record_remote_read(
+                &crate::metrics::RemoteSource::LocalFile,
+                crate::metrics::RemoteReadOperation::ReadRangeInto,
+                &result,
+                |n| *n as u64,
+                start.elapsed(),
+            );
+            result
+        })
     }
 
     #[cfg(feature = "io-uring")]

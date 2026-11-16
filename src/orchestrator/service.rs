@@ -1023,33 +1023,22 @@ where
         sandbox_id: SandboxId,
         previous_state: SandboxState,
     ) -> Result<()> {
-        let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        let _p_total = crate::observability::stage_probe::StageProbe::start("delete.total", "");
+        // Async delete: the control-plane record is removed before returning, so
+        // the sandbox is immediately invisible. Stopping firecracker (~120 ms of
+        // kernel fd teardown) and artifact cleanup run in a detached task.
+        let _ = previous_state;
 
-        // If the sandbox is still in memory, attempt to stop it.
-        if let Some(handle) = handle {
-            let stop_result = {
-                let mut sandbox = handle.lock().await;
-                sandbox.stop().await
-            };
+        let (handle, removed_route) = {
+            let _p = crate::observability::stage_probe::StageProbe::start("delete.detach", "");
+            self.detach_sandbox_handle_and_route(&sandbox_id).await
+        };
+        let _ = removed_route;
 
-            if let Err(err) = stop_result {
-                warn!(error = ?err, "failed to stop sandbox during delete");
-                self.sandboxes.write().await.insert(sandbox_id, handle);
-                self.restore_proxy_route(sandbox_id, removed_route).await;
-                self.store
-                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
-                    .await?;
-
-                return Err(OrchestratorError::SandboxOperationFailed {
-                    sandbox_id,
-                    operation: SandboxOperation::Stop,
-                    source: err,
-                });
-            }
-        }
-
-        // Now the sandbox is successfully stopped, remove its metadata.
-        let metadata = self.store.remove(&sandbox_id).await?;
+        let metadata = {
+            let _p = crate::observability::stage_probe::StageProbe::start("delete.store_remove", "");
+            self.store.remove(&sandbox_id).await?
+        };
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
@@ -1057,16 +1046,60 @@ where
                 metadata.resources,
             );
         }
-        if let Err(err) = self
-            .persister
-            .delete_record_and_artifacts(&sandbox_id)
-            .await
-        {
-            warn!(error = ?err, "failed to delete persisted sandbox state");
+
+        match handle {
+            Some(handle) => {
+                let this = Arc::clone(self);
+                let id = sandbox_id;
+                tokio::spawn(async move {
+                    let _p = crate::observability::stage_probe::StageProbe::start(
+                        "delete.bg_stop",
+                        format!("id={id}"),
+                    );
+                    let stop_result = {
+                        let mut sandbox = {
+                            let _p = crate::observability::stage_probe::StageProbe::start(
+                                "delete.lock",
+                                "",
+                            );
+                            handle.lock().await
+                        };
+                        sandbox.stop().await
+                    };
+                    if let Err(err) = stop_result {
+                        warn!(error = ?err, %id, "background sandbox stop failed");
+                    }
+                    let persist_result = {
+                        let _p = crate::observability::stage_probe::StageProbe::start(
+                            "delete.persist",
+                            "",
+                        );
+                        this.persister.delete_record_and_artifacts(&id).await
+                    };
+                    if let Err(err) = persist_result {
+                        warn!(error = ?err, %id, "failed to delete persisted sandbox state");
+                    }
+                    this.release_image_refs(RuntimeImageOwner::PausedSandbox(id))
+                        .await;
+                    info!(%id, "sandbox deleted (background stop complete)");
+                });
+            }
+            None => {
+                let persist_result = {
+                    let _p = crate::observability::stage_probe::StageProbe::start(
+                        "delete.persist",
+                        "",
+                    );
+                    self.persister.delete_record_and_artifacts(&sandbox_id).await
+                };
+                if let Err(err) = persist_result {
+                    warn!(error = ?err, "failed to delete persisted sandbox state");
+                }
+                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                    .await;
+                info!("sandbox deleted");
+            }
         }
-        self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
-            .await;
-        info!("sandbox deleted");
 
         Ok(())
     }

@@ -593,6 +593,8 @@ impl FileCacheBackend {
         // The guard punches the range back if the source read fails, is
         // short, or the future is cancelled, so a failed refill leaves
         // neither unaccounted disk blocks nor partially written pages.
+        let source_kind = if cache_id.contains("sharedfs") { "sharedfs" } else { "object" };
+        let t_reserve = std::time::Instant::now();
         let reservation = entry.reserve_range(offset, want as u64)?;
 
         // The caller holds the entry's refill barrier and passes the stable
@@ -607,9 +609,29 @@ impl FileCacheBackend {
                 .ok_or_else(|| anyhow!("block offset beyond source size"))?
         };
         let buf_len = buf.len();
+        ::metrics::histogram!(
+            "agentenv_overlaybd_cache_refill_seconds",
+            "stage" => "reserve",
+            "source" => source_kind,
+        )
+        .record(t_reserve.elapsed().as_secs_f64());
+
+        // Sample how many refills are in flight when this block starts its source read.
+        ::metrics::histogram!(
+            "agentenv_overlaybd_cache_refill_inflight",
+            "source" => source_kind,
+        )
+        .record(self.active_refills.load(Ordering::Relaxed) as f64);
 
         // Read from source directly into the mmap region (zero-copy into page cache).
+        let t_read = std::time::Instant::now();
         let n = reader.read(source.as_ref(), offset, buf).await?;
+        ::metrics::histogram!(
+            "agentenv_overlaybd_cache_refill_seconds",
+            "stage" => "source_read",
+            "source" => source_kind,
+        )
+        .record(t_read.elapsed().as_secs_f64());
         if n != buf_len {
             bail!(
                 "short refill read for cache_id={cache_id}, offset={offset}, got {n}, want {buf_len}"
@@ -618,6 +640,7 @@ impl FileCacheBackend {
 
         // Commit before publishing: prevent RAII from punching holes in case
         // of error (rollback).
+        let t_commit = std::time::Instant::now();
         reservation.commit();
 
         // Just update the bitmap — data is already in place via mmap.
@@ -626,6 +649,22 @@ impl FileCacheBackend {
 
         // Update global capacity and pressure state atomically as a pair.
         self.add_current_bytes(want as u64);
+        ::metrics::histogram!(
+            "agentenv_overlaybd_cache_refill_seconds",
+            "stage" => "commit",
+            "source" => source_kind,
+        )
+        .record(t_commit.elapsed().as_secs_f64());
+        ::metrics::counter!(
+            "agentenv_overlaybd_cache_refill_blocks_total",
+            "source" => source_kind,
+        )
+        .increment(1);
+        ::metrics::counter!(
+            "agentenv_overlaybd_cache_refill_bytes_total",
+            "source" => source_kind,
+        )
+        .increment(want as u64);
 
         Ok(())
     }

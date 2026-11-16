@@ -954,15 +954,19 @@ impl FirecrackerSandbox {
     pub async fn stop(&mut self) -> Result<()> {
         debug!("stopping firecracker sandbox");
 
-        self.fc_instance
-            .stop(self.runtime_policy.socket_timeout)
-            .await?;
+        {
+            let _p = crate::observability::stage_probe::StageProbe::start("delete.fc_stop", "");
+            self.fc_instance
+                .stop(self.runtime_policy.socket_timeout)
+                .await?;
+        }
 
         // Clear envd instance
         self.envd_instance = None;
 
         // Cleanup ublk device (must happen after FC stop, before network cleanup)
         if let Some(runtime) = self.rootfs_runtime.take() {
+            let _p = crate::observability::stage_probe::StageProbe::start("delete.ublk_rootfs", "");
             if let Err(e) = UblkDeviceManager::global()
                 .release_device(&runtime.device)
                 .await
@@ -974,12 +978,14 @@ impl FirecrackerSandbox {
         // Shared memory device: release explicitly so a following resume for
         // the same memory image cannot race the detached Drop cleanup.
         if let Some(mem_device) = self.mem_ublk_device.take() {
+            let _p = crate::observability::stage_probe::StageProbe::start("delete.ublk_mem", "");
             if let Err(e) = mem_device.release().await {
                 warn!(error = %e, "failed to release shared memory ublk device during stop");
             }
         }
 
         for runtime in self.extra_drive_runtimes.drain(..) {
+            let _p = crate::observability::stage_probe::StageProbe::start("delete.ublk_extra", "");
             if let Err(e) = UblkDeviceManager::global()
                 .release_device(&runtime.device)
                 .await
@@ -996,6 +1002,7 @@ impl FirecrackerSandbox {
 
         // Cleanup network resources
         if let Some(slot) = self.network_slot.take() {
+            let _p = crate::observability::stage_probe::StageProbe::start("delete.network", "");
             let idx = slot.idx;
             NetworkManager::global()
                 .release(slot)
